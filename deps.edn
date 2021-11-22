@@ -1,6 +1,5 @@
 {:paths ["src"]
- :deps  {meander/epsilon       {:mvn/version "0.0.650"}
-         missionary/missionary {:mvn/version "b.23"}
+ :deps  {missionary/missionary {:mvn/version "b.23"}
          com.taoensso/timbre   {:mvn/version "5.1.2"}}
  :aliases
  {:dev
@@ -19,5 +18,4 @@
    :extra-deps  {io.github.clojure/tools.build {:git/tag "v0.1.9" :git/sha "6736c83"}
                  slipset/deps-deploy           {:mvn/version "RELEASE"}}
    :exec-fn     build/clojars}
-  :cljs {:extra-deps {thheller/shadow-cljs {:mvn/version "2.11.15"}}}}}
-
+  :cljs {:extra-deps {thheller/shadow-cljs {:mvn/version "2.16.6"}}}}}
