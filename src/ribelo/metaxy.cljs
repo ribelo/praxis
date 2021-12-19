@@ -80,12 +80,6 @@
     (-> @dag (.get id) .-deps))
 
   IFn
-  (-invoke [_]
-    (let [>f  (-> @dag (.get id) .-flow)
-          dfv (mi/dfv)]
-      ((mi/ap (dfv (mi/?> >f))) prn prn)
-      dfv))
-
   (-invoke [_ deps]
     ((-> @dag (.get id) .-f) id deps))
 
