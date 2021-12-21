@@ -99,30 +99,23 @@
   (->Vertex id f input deps flow))
 
 (defn- -link! [id >fs]
-  (tap> [:-link! :id id :fs >fs :vrtx (get @dag id)])
   (if-let [vrtx (get-node id)]
     (mi/signal! (apply mi/latest (fn [& args] [id (vrtx (into {} args))]) >fs))
     (throw (ex-info "node dosen't exists!" {:id id}))))
 
 (defn- -build-graph []
-  (tap> [:-build-graph])
   (loop [[[id vrtx] & more] @dag acc []]
-    (tap> [:-build-graph :id id :vrtx vrtx])
     (if id
       (if-let [f (some-> vrtx .-flow mi/signal!)]
         (recur more (conj acc f))
         (let [ks (.-deps vrtx)
-              _ (tap> (tap> [:-build-graph :deps ks]))
               in (mapv (fn [k]
                          (if-let [>f (some-> @dag (.get k) .-flow)]
                            >f
                            (throw (ex-info "node dosen't exists!" {:id k})))) ks)]
-          (tap> [:-build-graph :in in :every (every? some? in)])
           (if (every? some? in)
             (let [>f (-link! id in)]
-              (tap> [:-build-graph :after-link])
               (swap! dag assoc-in [id :flow] >f)
-              (tap> [:-build-graph :after-swap])
               (recur more (conj acc >f)))
             (recur (conj (into [] more) [id vrtx]) acc))))
       acc)))
@@ -236,13 +229,11 @@
 ;;       (-reset! [_ x] (set-state! x)))))
 
 (defn build! []
-  (tap> :build!)
   (if-not @reactor
     (reset! reactor
       (mi/reactor
        (let [xs (-build-graph)
              >e (mi/stream! (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))]
-         (tap> [:xs xs])
          (stream >e)
          (reduce (fn [acc >f] (conj acc (mi/stream! >f))) [] xs)
          (mi/stream! (->> >e (mi/eduction (filter update-event?) (map (fn [e] (-process-update-event e))))))
@@ -251,7 +242,6 @@
     (timbre/error "graph already builded!")))
 
 (defn run! []
-  (tap> :run!)
   (if-let [r @reactor]
     (r #() #(timbre/error %))
     (do (build!) (run!))))
@@ -329,7 +319,6 @@
          (update [id {::keys [store]}]
            {::store {:a 2 :b 3 :c 4}})))
 
-(tap> dag)
 
 (def a_ (listen! dag
           ::a
