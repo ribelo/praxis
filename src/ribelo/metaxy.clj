@@ -19,26 +19,27 @@
     ;; empty case
     (me/or [{}] {}) []))
 
-(defmacro defnode [dag id vargs & body]
+(defmacro defnode [id vargs & body]
   (if (seq body)
     (let [[nid m & more] vargs
           deps (parse-input m)]
-      `(ribelo.metaxy/add-node!
-         ~dag ~id ~deps
-         ~(if-not (seq more)
-            `(fn [~nid ~m]
-               ~@body)
-            `(fn [~nid ~m]
-               (fn ~(vec more)
-                 ~@body)))))
+      `(do
+         (ribelo.metaxy/add-node!
+           ~id ~deps
+           ~(if-not (seq more)
+              `(fn [~nid ~m]
+                 ~@body)
+              `(fn [~nid ~m]
+                 (fn ~(vec more)
+                   ~@body))))))
     `(ribelo.metaxy/add-node!
-       ~dag ~id ~vargs)))
+      ~id ~vargs)))
 
 (defmacro reify
   ([id & impls]
    `(~'cljs.core/reify
      ~'ribelo.metaxy/Identifiable
-     (~'-id [~'_] ~id)
+     (~'id [~'_] ~id)
      ~@impls)))
 
 (defmacro defevent [name' [_e deps & more] & body]
