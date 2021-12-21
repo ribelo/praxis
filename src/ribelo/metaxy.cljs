@@ -11,7 +11,7 @@
 
 (def ^:private nodes_ (atom {}))
 (def ^:private mbx (mi/mbx))
-(def ^:private stream (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))
+(def ^:private stream (mi/dfv))
 (def reactor (atom nil))
 
 (def dag
@@ -41,8 +41,11 @@
       (when-let [n (dag k)]
         ((n x) y)))))
 
-(defn dispatch [x]
-  (mbx x))
+(defmulti dispatch (fn [e _] e))
+
+(defmethod dispatch :default
+  [e]
+  (mbx e))
 
 (defprotocol UpdateEvent
   (update [_ dag]))
@@ -61,6 +64,15 @@
 
 (defn effect-event? [e]
   (satisfies? EffectEvent e))
+
+(defn promise?
+  "Return `true` if `v` is a promise instance or is a thenable
+  object.
+  https://github.com/funcool/potok/blob/master/src/potok/core.cljs#L74"
+  [v]
+  (or (instance? js/Promise v)
+      (and (goog.isObject v)
+           (fn? (unchecked-get v "then")))))
 
 (defn- -reset-graph-input! [dag m]
   (reduce-kv (fn [_ k v] (when-let [atm_ (-> @dag (.get k) .-input)] (reset! atm_ v))) nil m))
@@ -131,26 +143,37 @@
   ((mi/sp
      (let [fs   (mapv (fn [id] (.-flow (.get @dag id))) (dependencies e))
            r    (mi/? (mi/reduce (comp reduced {}) nil (apply mi/latest (fn [& args] (update e (into {} args))) fs)))]
-       (cond
-         (map? r)  (-reset-graph-input! dag r)
-         (fn? r)   (r #(-reset-graph-input! dag %) #(handle-error e %))
-         (some? r) (timbre/errorf "result of UpdateEvent: %s should be a map or missionary ap!" (id e)))))
+       (if (map? r)
+         (-reset-graph-input! dag r)
+         (timbre/errorf "result of UpdateEvent: %s should be a map or missionary ap!" (id e)))))
    #() #(handle-error e %)))
 
 (defn- -process-watch-event [e]
   ((mi/sp
-     (when-let [>f (watch e dag stream)]
-       (if (fn? >f)
-         (mi/? (mi/reduce (fn [_ e] (dispatch e)) >f))
-         (timbre/errorf "result of WatchEvent: %s should be missionary ap!" (id e)))))
+    (when-let [>f (watch e dag (mi/? stream))]
+      (cond
+        (fn? >f)
+        (mi/? (mi/reduce (fn [_ e] (dispatch e)) >f))
+
+        (promise? >f)
+        (-> >f (.then (fn [s] (dispatch s))) (.catch (fn [err] (handle-error e err))))
+
+        :else
+        (timbre/errorf "result of WatchEvent: %s should be missionary ap! or js/promise" (id e)))))
    #() #(handle-error e %)))
 
 (defn- -process-effect-event [e]
   ((mi/sp
-     (when-let [>f (effect e dag stream)]
-       (if (and >f (fn? >f))
-         (mi/? (mi/reduce (constantly nil) >f))
-         (timbre/errorf "result of EffectEvent %s should be missionary ap!" (id e)))))
+    (when-let [>f (effect e dag (mi/? stream))]
+      (cond
+        (fn? >f)
+        (mi/? (mi/reduce (constantly nil) >f))
+
+        (promise? >f)
+        (-> >f (.then #()) (.catch (fn [err] (handle-error e err))))
+
+        :else
+        (timbre/errorf "result of EffectEvent: %s should be missionary ap! or js/promise" (id e)))))
    #() #(handle-error e %)))
 
 (defn add-node!
@@ -193,25 +216,28 @@
 (defn listen! [deps f]
   (let [dfv (mi/dfv)]
     (dispatch
-      (reify (random-uuid)
-        EffectEvent
-        (effect [e m _]
-          (let [deps (cond-> deps (not (seq? deps)) vector)
-                fs   (mapv (fn [id] (some-> (.get @dag id) .-flow)) deps)]
-            (if (reduce (fn [_ >f] (if >f true (reduced false))) false fs)
-              (dfv (mi/stream! (apply mi/latest (fn [& args] (f e (into {} args))) fs)))
-              (timbre/error "some of deps dosen't exists!"))))))
+     (reify (str "listen-" (random-uuid))
+       EffectEvent
+       (effect [e m _]
+         (let [deps (cond-> deps (not (seq? deps)) vector)
+               fs   (mapv (fn [id] (some-> (.get @dag id) .-flow)) deps)]
+           (if (reduce (fn [_ >f] (if >f true (reduced false))) false fs)
+             (dfv (mi/stream! (apply mi/latest (fn [& args] (f e (into {} args))) fs)))
+             (timbre/error "some of deps dosen't exists!"))))))
     (fn []
       ((mi/sp (when-let [>f (mi/? dfv)] (>f))) #() #()))))
 
-(defn subscribe! [id x]
-  (let [atm_ (atom nil)]
-    (listen! id
-      (fn [_ m]
-        (if (= ::none x)
-          (reset! atm_ (.get m id))
-          (reset! atm_ ((.get m id) x)))))
-    atm_))
+(defn subscribe!
+  ([id]
+   (subscribe! id ::none))
+  ([id x]
+   (let [atm_ (atom nil)]
+     (listen! id
+       (fn [_ m]
+         (if (= ::none x)
+           (reset! atm_ (.get m id))
+           (reset! atm_ ((.get m id) x)))))
+     atm_)))
 
 ;; (subscribe! [this id m]
 ;;   (let [-m (react/useRef m)
@@ -273,7 +299,7 @@
   (+ a b x))
 
 (run!)
-(def lstn (listen! dag ::c (fn [e {::keys [c]}]
+(def lstn (listen! ::c (fn [e {::keys [c]}]
                              (println :e e)
                              (println :dag dag)
                              (println :lstn ::c (c {:x 10})))))
@@ -284,12 +310,15 @@
 (lstn)
 (dispose)
 
-(defupdate update-test
+(defupdate ::update-test
   [e {::keys [store]}]
   (println :update-test store)
   {::store {:a (rand-int 10) :b (rand-int 10) :c (rand-int 10)}})
 
-(emit! dag (update-test))
+(defupdate ::update-test2
+  [e {::keys [store]} {:keys [x]}]
+  (println :update-test2 :x x)
+  {::store {:a x :b x :c x}})
 
 (emit! dag
        (reify ::update-test
