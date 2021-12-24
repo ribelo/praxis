@@ -5,7 +5,7 @@
    #?(:clj [clojure.core :as clj] :cljs [cljs.core :as cljs])
    [taoensso.timbre :as timbre]
    [missionary.core :as mi]
-   ;; ["react" :as react]
+   ["react" :as react]
    #?(:clj [meander.epsilon :as me])))
 
 ;; macros
@@ -251,17 +251,17 @@
 
          IFn
          (-invoke [_]
-           ((-> @nodes_ (.get id) .-flow)))
+           (.-flow ^Vertex (.get @nodes_ id)))
 
          (-invoke [_ deps]
-           ((-> @nodes_ (.get id) .-f) id deps))
+           ((.-f ^Vertex (.get @nodes_ id)) id deps))
 
          (-invoke [_ s f]
-           ((-> @nodes_ (.get id) .-flow) s f))
+           ((.-flow ^Vertex (.get @nodes_ id)) s f))
 
          IDeref
          (-deref [_]
-           (let [>f (-> @nodes_ (.get id) .-flow)]
+           (let [>f (.-flow ^Vertex (.get @nodes_ id))]
              (mi/reduce (comp reduced {}) nil >f)))
          ))))
 
@@ -294,7 +294,7 @@
 
 (defn- -process-update-event [e]
   ((mi/sp
-     (let [fs   (mapv (fn [id] (.-flow (.get @dag id))) (dependencies e))
+     (let [fs   (mapv (fn [id] (.-flow ^Vertex (.get @dag id))) (dependencies e))
            r    (mi/? (mi/reduce (comp reduced {}) nil (apply mi/latest (fn [& args] (update e (into {} args))) fs)))]
        (if (map? r)
          (-reset-graph-input! dag r)
@@ -335,7 +335,7 @@
   ([id x]
    (when-let [vrtx (.get @dag id)]
      (timbre/warn "overwriting node id:" id)
-     (when-let [>flow (.-flow vrtx)]
+     (when-let [>flow (.-flow ^Vertex vrtx)]
        (try (>flow) (catch #?(:clj Exception :cljs :default) _ nil))))
    (cond
      (instance? #?(:clj clojure.lang.Atom :cljs Atom) x)
@@ -351,14 +351,14 @@
   ([id deps f]
    (when-let [vrtx (.get @dag id)]
      (timbre/warn "overwriting node id:" id)
-     (when-let [>flow (.-flow vrtx)]
+     (when-let [>flow (.-flow ^Vertex vrtx)]
        (try (>flow) (catch #?(:clj Exception :cljs :default) _ nil))))
    (swap! dag assoc id (-vertex {:id id :f f :deps deps})))
 
   ([id deps f >flow]
    (when-let [vrtx (.get @dag id)]
      (timbre/warn "overwriting node id:" id)
-     (when-let [>flow (.-flow vrtx)]
+     (when-let [>flow (.-flow ^Vertex vrtx)]
        (>flow)))
    (swap! @dag assoc id (-vertex {:id id :f f :deps deps :flow >flow}))))
 
@@ -375,7 +375,7 @@
        EffectEvent
        (effect [e m _]
          (let [deps (cond-> deps (not (seq? deps)) vector)
-               fs   (mapv (fn [id] (some-> (.get @dag id) .-flow)) deps)]
+               fs   (mapv (fn [id] (some-> ^Vertex (.get @dag id) .-flow)) deps)]
            (if (reduce (fn [_ >f] (if >f true (reduced false))) false fs)
              (dfv (mi/stream! (apply mi/latest (fn [& args] (f e (into {} args))) fs)))
              (timbre/error "some of deps dosen't exists!"))))))
