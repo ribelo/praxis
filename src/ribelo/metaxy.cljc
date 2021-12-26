@@ -56,7 +56,7 @@
           ~id ~vargs))))
 
 #?(:clj
-   (defmacro defevent [id [_e deps & more] & body]
+   (defmacro defevent [id [_e deps _ & more] & body]
      `(defmethod ribelo.metaxy/event ~id ~(into ['id] more)
         (reify ~id
           ~'ribelo.metaxy/INode
@@ -64,8 +64,8 @@
           ~@body))))
 
 #?(:clj
-   (defmacro defupdate [id [e deps & _more :as vargs] & body]
-     `(defevent ~id ~vargs
+   (defmacro defupdate [id [e deps & more] & body]
+     `(defevent ~id [~e ~deps nil ~@more]
         ~'ribelo.metaxy/UpdateEvent
         (ribelo.metaxy/update [~e ~deps]
           ~@body))))
@@ -184,8 +184,9 @@
     ([e _ _ _ _ _ _ _] e)))
 
 (defmethod event :default [e]
-  (timbre/warnf "Using default event handler for %s, returning value as is, consider adding own method!"
-                (if (identifiable? e) (id e) e))
+  (when-not (and (identifiable? e) (string? (id e)) (zero? (.indexOf (id e) "listen")))
+    (timbre/warnf "Using default event handler for %s, returning value as is, consider adding own method!"
+                  (if (identifiable? e) (id e) e)))
   e)
 
 (defn dispatch [& args]
@@ -225,6 +226,11 @@
      (or (instance? js/Promise v)
          (and (goog.isObject v)
               (fn? (unchecked-get v "then"))))))
+
+(defn publisher?
+  [v]
+  #?(:clj (instance? missionary.impl.Reactor$Publisher v)
+     :cljs (instance? missionary.impl/Publisher v)))
 
 (defn- -reset-graph-input! [dag m]
   (reduce-kv (fn [_ k v] (when-let [atm_ (-> @dag (.get k) .-input)] (reset! atm_ v))) nil m))
@@ -307,19 +313,18 @@
 (defn- -process-update-event [e]
   ((mi/sp
     (let [fs   (mapv (fn [id] (let [^Vertex vrtx (.get @dag id)] (.-flow vrtx))) (dependencies e))
-           r    (mi/? (mi/reduce (comp reduced {}) nil (apply mi/latest (fn [& args] (update e (into {} args))) fs)))]
-       (if (map? r)
-         (-reset-graph-input! dag r)
-         (timbre/errorf "result of UpdateEvent: %s should be a map or missionary ap!, but is %s" (id e) (type r)))))
+          r    (mi/? (mi/reduce (comp reduced {}) nil (apply mi/latest (fn [& args] (update e (into {} args))) fs)))]
+      (if (map? r)
+        (-reset-graph-input! dag r)
+        (timbre/errorf "result of UpdateEvent: %s should be a map or missionary ap!, but is %s" (id e) (type r)))))
    (constantly nil) #(handle-error e %)))
 
 (defn- -process-watch-event [e]
   ((mi/sp
     (when-let [>f (watch e dag (mi/? stream))]
       (cond
-        #?(:clj  (or (fn? >f) (instance? missionary.impl.Reactor$Publisher >f))
-           :cljs (or (fn? >f) (instance? missionary.impl/Publisher >f)))
-        (mi/? (mi/reduce (fn [_ e] (dispatch e)) >f))
+        (or (fn? >f) (publisher? >f))
+        (mi/? (mi/reduce (fn [_ e] (mbx e)) >f))
 
         #?@(:cljs
             [(promise? >f)
@@ -333,9 +338,8 @@
   ((mi/sp
     (when-let [>f (effect e dag (mi/? stream))]
       (cond
-        #?(:clj  (or (fn? >f) (instance? missionary.impl.Reactor$Publisher >f))
-           :cljs (or (fn? >f) (instance? missionary.impl/Publisher >f)))
-        (mi/? (mi/reduce (constantly nil) >f))
+        (or (fn? >f) (publisher? >f))
+        (mi/stream! >f)
 
         #?@(:cljs
             [(promise? >f)
@@ -385,14 +389,18 @@
 (defn listen! [deps f]
   (let [dfv (mi/dfv)]
     (dispatch
-     (reify (str "listen-" #?(:clj (java.util.UUID/randomUUID) :cljs (random-uuid)))
+     (reify (str "listen-" deps "-" #?(:clj (java.util.UUID/randomUUID) :cljs (random-uuid)))
        EffectEvent
        (effect [e m _]
          (let [deps (cond-> deps (not (seq? deps)) vector)
-               fs   (mapv (fn [id] (some-> ^Vertex (.get @dag id) .-flow)) deps)]
-           (if (reduce (fn [_ >f] (if >f true (reduced false))) false fs)
-             (dfv (mi/stream! (apply mi/latest (fn [& args] (f e (into {} args))) fs)))
-             (timbre/error "some of deps dosen't exists!"))))))
+               fs   (mapv (fn [id] (or (some-> ^Vertex (.get @dag id) .-flow) id)) deps)]
+           (if-let [missing (seq (persistent!
+                                  (reduce
+                                   (fn [acc x] (if (publisher? x) acc (conj! acc x)))
+                                   (transient [])
+                                   fs)))]
+             (timbre/errorf "some of deps dosen't exists! %s" missing)
+             (dfv (apply mi/latest (fn [& args] (f e (into {} args))) fs)))))))
     (fn []
       ((mi/sp (when-let [>f (mi/? dfv)] (>f))) (constantly nil) (constantly nil)))))
 
@@ -449,10 +457,10 @@
         (react/useEffect
          (fn []
            (set! (.-current -m) m)
-
-           (listen! id (fn [_ v] (if (keyword-identical? m ::none)
-                                  (set-state! (.get v id))
-                                  (set-state! ((.get v id) m))))))
+           (listen! id (fn [_ v]
+                         (if (keyword-identical? m ::none)
+                           (set-state! (.get v id))
+                           (set-state! ((.get v id) m))))))
          #js [(str id) m'])
         (cljs.core/reify
           IDeref
