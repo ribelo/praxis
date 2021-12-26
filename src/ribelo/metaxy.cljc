@@ -192,13 +192,6 @@
 (defn dispatch [& args]
   (mbx (apply event args)))
 
-(defmulti handle-error (fn [e _err] (id ^Identifiable e)))
-
-(defmethod handle-error :default
-  [e err]
-  (timbre/warn "Using default error handler, consider using your own!")
-  (timbre/error "event failure id:" (id e) (ex-message err)))
-
 (defprotocol UpdateEvent
   (update [_ dag]))
 
@@ -216,6 +209,24 @@
 
 (defn effect-event? [e]
   (satisfies? EffectEvent e))
+
+(defn event-type [e]
+  (cond
+    (update-event? e) "UpdateEvent"
+    (watch-event? e)  "WatchEvent"
+    (effect-event? e) "EffectEvent"
+    :else             "UnknownEvent"))
+
+(defmulti handle-error (fn [e _err] (id ^Identifiable e)))
+
+(defmethod handle-error :default
+  [e err]
+  (timbre/warn "Using default error handler, consider using your own!")
+  (timbre/errorf "%s failure id: %s"
+                 (event-type e)
+                 (id e))
+  (timbre/error (ex-message err)))
+
 
 #?(:cljs
    (defn promise?
@@ -290,7 +301,7 @@
 
 (defn- -link! [id >fs]
   (if-let [vrtx (get-node id)]
-    (mi/signal! (apply mi/latest (fn [& args] [id (vrtx (into {} args))]) >fs))
+    (mi/signal! (mi/eduction (dedupe) (apply mi/latest (fn [& args] [id (vrtx (into {} args))]) >fs)))
     (throw (ex-info (str "node " id " dosen't exists!") {:id id}))))
 
 (defn- -build-graph []
@@ -323,8 +334,11 @@
   ((mi/sp
     (when-let [>f (watch e dag (mi/? stream))]
       (cond
-        (or (fn? >f) (publisher? >f))
+        (fn? >f)
         (mi/? (mi/reduce (fn [_ e] (mbx e)) >f))
+
+        (publisher? >f)
+        >f
 
         #?@(:cljs
             [(promise? >f)
@@ -338,8 +352,11 @@
   ((mi/sp
     (when-let [>f (effect e dag (mi/? stream))]
       (cond
-        (or (fn? >f) (publisher? >f))
+        (fn? >f)
         (mi/stream! >f)
+
+        (publisher? >f)
+        >f
 
         #?@(:cljs
             [(promise? >f)
@@ -400,9 +417,13 @@
                                    (transient [])
                                    fs)))]
              (timbre/errorf "some of deps dosen't exists! %s" missing)
-             (dfv (apply mi/latest (fn [& args] (f e (into {} args))) fs)))))))
+             (dfv (->> (apply mi/latest (fn [& args] (into {} args)) fs)
+                       (mi/eduction (comp (dedupe) (map (fn [dag] (f e dag)))))
+                       (mi/stream!))))))))
     (fn []
-      ((mi/sp (when-let [>f (mi/? dfv)] (>f))) (constantly nil) (constantly nil)))))
+      ((mi/sp (when-let [>f (mi/? dfv)] (>f)))
+       #(timbre/debugf "successful unlisten %s" deps)
+       #(timbre/errorf "unsuccessful unlisten %s %s" deps %)))))
 
 #?(:clj
    (defn value
@@ -413,8 +434,10 @@
             lstn (listen! id
                    (fn [_ m]
                      (if #?(:clj (identical? ::none x) :cljs (keyword-identical? ::none x))
-                       (reset! atm_ (.get m id))
-                       (reset! atm_ ((.get m id) x)))))]
+                       (when-not (= (.get m id) @atm_)
+                         (reset! atm_ (.get m id)))
+                       (when-not (= ((.get m id) x) @atm_)
+                         (reset! atm_ ((.get m id) x))))))]
         (clojure.core/reify
           clojure.lang.IRef
           (deref [_] @atm_)
@@ -430,8 +453,10 @@
             lstn (listen! id
                    (fn [_ m]
                      (if #?(:clj (identical? ::none x) :cljs (keyword-identical? ::none x))
-                       (reset! atm_ (.get m id))
-                       (reset! atm_ ((.get m id) x)))))]
+                       (when-not (= (.get m id) @atm_)
+                         (reset! atm_ (.get m id)))
+                       (when-not (= ((.get m id) x) @atm_)
+                         (reset! atm_ ((.get m id) x))))))]
         (cljs.core/reify
           IDeref
           (-deref [_] @atm_)
@@ -454,10 +479,16 @@
       (let [-m (react/useRef m)
             m' (if (= m (.-current -m)) (.-current -m) m)
             [state set-state!] (react/useState nil)]
+        (when (= :edo.subs/query-data id) (tap> [:subscribe :id id m]))
         (react/useEffect
          (fn []
+           (when (= :edo.subs/query-data id) (tap> [:effect :id id m]))
            (set! (.-current -m) m)
            (listen! id (fn [_ v]
+                         (when (= :edo.subs/query-data id)
+                           (tap> [:listen :id id :m m])
+                           (tap> [:listen :id id :v (.get v id)])
+                           (tap> [:listen :id id :r ((.get v id) m)]))
                          (if (keyword-identical? m ::none)
                            (set-state! (.get v id))
                            (set-state! ((.get v id) m))))))
@@ -493,6 +524,17 @@
 
 (comment
   (defnode ::store {:a 1 :b 1 :c 1})
+
+  (def cancel (mi/dfv))
+  (def mbx (mi/mbx))
+  (def >f (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))
+  (def dispose
+    ((mi/reactor
+      (mi/stream! (mi/ap (println :x (mi/?> >f))))
+      (cancel (mi/stream! (mi/seed (range 10)))))
+     prn prn))
+  (mbx 1)
+  ((mi/? cancel))
 
   (defnode ::a
     [id {::keys [store]}]
