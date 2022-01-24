@@ -1,7 +1,9 @@
 {:paths ["src"]
- :deps  {missionary/missionary {:mvn/version "b.25"}
+ :deps  {missionary/missionary {:mvn/version "b.26"}
          com.taoensso/timbre   {:mvn/version "5.1.2"}
-         meander/epsilon       {:mvn/version "0.0.650"}}
+         meander/epsilon       {:mvn/version "0.0.650"}
+         ribelo/extropy        {:git/url "https://github.com/ribelo/extropy"
+                                :sha "8a20f3067a53acfeae5cc026d726fbbab06f1ae3"}}
  :aliases
  {:dev
   {:extra-deps

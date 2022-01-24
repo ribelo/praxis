@@ -1,113 +1,106 @@
-(ns ribelo.metaxy
+(ns ribelo.praxis
   (:refer-clojure :exclude [update run! reify])
-  #?(:cljs (:require-macros [ribelo.metaxy :refer [reify defnode defupdate defwatch defeffect]]))
+  #?(:cljs (:require-macros [ribelo.praxis :refer [reify defnode defupdate defwatch defeffect]]))
   (:require
    #?(:clj [clojure.core :as clj] :cljs [cljs.core :as cljs])
    [taoensso.timbre :as timbre]
    [missionary.core :as mi]
-   #?(:cljs ["react" :as react])
-   #?(:clj [meander.epsilon :as me])))
+   [ribelo.extropy :as ex]
+   #?(:cljs ["react" :as react])))
 
-;; macros
-
-#?(:clj (defmacro if-clj  [then & [else]] (if (:ns &env) else then)))
+;; * macros
 
 #?(:clj
    (defmacro reify
      ([id & impls]
-      `(~(if-clj 'clojure.core/reify 'cljs.core/reify)
-        ~'ribelo.metaxy/Identifiable
-        (~'id [~'_] ~id)
+      `(~(ex/-if-clj 'clojure.core/reify 'cljs.core/reify)
+        ~'ribelo.praxis/IIdentifiable
+        (~'-id [~'_] ~id)
         ~@impls))))
 
 #?(:clj
-   (defn- parse-input
-     "parses the vector of function arguments to find all deps"
-     [v]
-     (me/rewrite v
-       ;; {:keys [a/b b/c]}
-       {:keys [(me/symbol _ _ :as !ss) ...] & ?more}
-       [(me/app keyword !ss) ... & (me/cata [?more])]
-       ;; {:a/keys [b c]}
-       {(me/keyword ?ns "keys") [(me/symbol _ _ :as (me/app name !ss)) ...] & ?more}
-       [(me/app (partial keyword ?ns) !ss) ... & (me/cata [?more])]
-       ;; {:a ?a :b ?b}
-       {(me/symbol _ _ :as ?s) (me/keyword _ _ :as ?k) & ?more}
-       [?k & (me/cata ?more)]
-       ;; empty case
-       (me/or [{}] {}) [])))
+   (defn- -parse-input [m]
+     (assert (map? m))
+     (ex/-loop [me m :let [acc (transient [])]]
+       (cond
+         (= "keys" (name (ex/-k* me)))
+         (recur (ex/-into! acc (map (ex/-comp (partial keyword (namespace (ex/-k* me))) name)) (ex/-v* me)))
+
+         :else
+         (recur (conj! acc (keyword (namespace (ex/-k* me)) (name (ex/-v* me))))))
+       (persistent! acc))))
 
 #?(:clj
    (defmacro defnode [id vargs & body]
      (if (seq body)
        (let [[nid m & more] vargs
-             deps (parse-input m)]
+             deps (-parse-input m)]
          `(do
-            (ribelo.metaxy/add-node!
+            (ribelo.praxis/add-node!
               ~id ~deps
               ~(if-not (seq more)
                  `(fn [~nid ~m]
                     ~@body)
                  `(fn [~nid ~m]
-                    (ribelo.metaxy/-memoize
-                     (fn ~(vec more)
-                       ~@body)))))))
-       `(ribelo.metaxy/add-node!
+                    (ribelo.extropy/-memoize
+                      (fn ~(vec more)
+                        ~@body)))))))
+       `(ribelo.praxis/add-node!
           ~id ~vargs))))
 
 #?(:clj
    (defmacro defevent [id [_e deps _ & more] & body]
-     `(defmethod ribelo.metaxy/event ~id ~(into ['id] more)
+     `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
         (reify ~id
-          ~'ribelo.metaxy/INode
-          (dependencies [~'_] ~(parse-input deps))
+          ~'ribelo.praxis/INode
+          (-dependencies [~'_] ~(-parse-input deps))
           ~@body))))
 
 #?(:clj
    (defmacro defupdate [id [e deps & more] & body]
      `(defevent ~id [~e ~deps nil ~@more]
-        ~'ribelo.metaxy/UpdateEvent
-        (ribelo.metaxy/update [~e ~deps]
+        ~'ribelo.praxis/UpdateEvent
+        (ribelo.praxis/update [~e ~deps]
           ~@body))))
 
 #?(:clj
    (defmacro defwatch [id [e deps stream & _more :as vargs] & body]
      `(defevent ~id ~vargs
-        ~'ribelo.metaxy/WatchEvent
-        (ribelo.metaxy/watch [~e ~deps ~stream]
+        ~'ribelo.praxis/WatchEvent
+        (ribelo.praxis/watch [~e ~deps ~stream]
                              ~@body))))
 
 #?(:clj
    (defmacro defeffect [name' [e deps stream & _more :as vargs] & body]
      `(defevent ~name' ~vargs
-        ~'ribelo.metaxy/EffectEvent
-        (ribelo.metaxy/effect [~e ~deps ~stream]
+        ~'ribelo.praxis/EffectEvent
+        (ribelo.praxis/effect [~e ~deps ~stream]
                               ~@body))))
 
 ;;
 
 (declare get-node)
 
-(def ^:private nodes_ (atom {}))
-(def ^:private mbx (mi/mbx))
-(def ^:private stream (mi/dfv))
-(def ^:private reactor (mi/dfv))
+(defonce ^:private nodes_ (atom {}))
+(defonce ^:private mbx (mi/mbx))
+(defonce ^:private stream_ (volatile! nil))
+(defonce ^:private reactor_ (volatile! nil))
 
-(defprotocol Identifiable
-  (id   [_]))
+(defprotocol IIdentifiable
+  (-id [_]))
 
 (defn identifiable? [e]
-  (satisfies? Identifiable e))
+  (satisfies? IIdentifiable e))
 
 (defprotocol INode
-  (dependencies [_]))
+  (-dependencies [_]))
 
 #?(:clj
    (def dag
      (clj/reify
        clojure.lang.ILookup
        (valAt [this k]
-         (when (.get @nodes_ k) (get-node k)))
+         (when (ex/-get* @nodes_ k) (get-node k)))
 
        clojure.lang.IRef
        (deref [_] @nodes_)
@@ -122,7 +115,7 @@
 
        clojure.lang.IFn
        (invoke [_ k]
-         (when (.valAt ^clojure.lang.ILookup @nodes_ k)
+         (when (ex/-get* @nodes_ k)
            (get-node k)))
 
        (invoke [_ k x]
@@ -137,7 +130,7 @@
      (cljs/reify
        ILookup
        (-lookup [this k]
-         (when (.get @nodes_ k)
+         (when (ex/-get* @nodes_ k)
            (get-node k)))
 
        IDeref
@@ -153,24 +146,13 @@
 
        IFn
        (-invoke [_ k]
-         (when (.get @nodes_ k) (get-node k)))
+         (when (ex/-get* @nodes_ k) (get-node k)))
        (-invoke [this k x]
          (when-let [n (dag k)]
            (n x)))
        (-invoke [this k x y]
          (when-let [n (dag k)]
            ((n x) y))))))
-
-(defn- -memoize [f]
-  (let [sentinel #?(:clj ::none :cljs (js/Symbol "none"))
-        mem (atom {})]
-    (fn [m]
-      (let [v #?(:clj (.valAt ^clojure.lang.ILookup @mem m sentinel) :cljs (.get @mem m sentinel))]
-        (if (identical? sentinel v)
-          (let [r (f m)]
-            (swap! mem assoc m r)
-            r)
-          v)))))
 
 (defmulti event
   (fn
@@ -184,22 +166,26 @@
     ([e _ _ _ _ _ _ _] e)))
 
 (defmethod event :default [e]
-  (when-not (and (identifiable? e) (string? (id e)) (zero? (.indexOf (id e) "listen")))
+  (when-not (and (identifiable? e) (string? (-id e)) (zero? (.indexOf (-id e) "listen")))
     (timbre/warnf "Using default event handler for %s, returning value as is, consider adding own method!"
-                  (if (identifiable? e) (id e) e)))
+                  (if (identifiable? e) (-id e) e)))
   e)
 
 (defn dispatch [& args]
-  (mbx (apply event args)))
+  (mbx (ex/-apply event args)))
 
 (defprotocol UpdateEvent
   (update [_ dag]))
 
 (defprotocol WatchEvent
-  (watch [_ node stream]))
+  (watch [_ dag stream]))
 
 (defprotocol EffectEvent
-  (effect [_ node stream]))
+  (effect [_ dag stream]))
+
+(defprotocol CustomEvent
+  (process [_ dag stream])
+  (props   [_           ]))
 
 (defn update-event? [e]
   (satisfies? UpdateEvent e))
@@ -210,6 +196,9 @@
 (defn effect-event? [e]
   (satisfies? EffectEvent e))
 
+(defn custom-event? [e]
+  (satisfies? CustomEvent e))
+
 (defn event-type [e]
   (cond
     (update-event? e) "UpdateEvent"
@@ -217,14 +206,14 @@
     (effect-event? e) "EffectEvent"
     :else             "UnknownEvent"))
 
-(defmulti handle-error (fn [e _err] (id ^Identifiable e)))
+(defmulti handle-error (fn [e _err] (-id ^IIdentifiable e)))
 
 (defmethod handle-error :default
   [e err]
   (timbre/warn "Using default error handler, consider using your own!")
   (timbre/errorf "%s failure id: %s"
                  (event-type e)
-                 (id e))
+                 (-id e))
   (timbre/error (ex-message err)))
 
 
@@ -240,58 +229,58 @@
 
 (defn publisher?
   [v]
-  #?(:clj (instance? missionary.impl.Reactor$Publisher v)
+  #?(:clj  (instance? missionary.impl.Reactor$Publisher v)
      :cljs (instance? missionary.impl/Publisher v)))
 
 (defn- -reset-graph-input! [dag m]
-  (reduce-kv (fn [_ k v] (when-let [atm_ (-> @dag (.get k) .-input)] (reset! atm_ v))) nil m))
+  (ex/-reduce-kv (fn [_ k v] (when-let [atm_ (-> @dag (ex/-get k) .-input)] (reset! atm_ v))) nil m))
 
 #?(:clj
    (defn get-node [id]
-     (when (.get @nodes_ id)
+     (when (ex/-get* @nodes_ id)
        (reify id
          INode
-         (dependencies [_]
-           (-> (.valAt ^clojure.lang.ILookup @nodes_ id) .-deps))
+         (-dependencies [_]
+           (-> (ex/-get*  @nodes_ id) .-deps))
 
          clojure.lang.IFn
          (invoke [_]
-           ((-> (.valAt ^clojure.lang.ILookup @nodes_ id) .-flow)))
+           ((-> (ex/-get*  @nodes_ id) .-flow)))
 
          (invoke [_ deps]
-           ((-> (.valAt ^clojure.lang.ILookup @nodes_ id) .-f) id deps))
+           ((-> (ex/-get*  @nodes_ id) .-f) id deps))
 
          (invoke [_ s f]
-           ((-> (.valAt ^clojure.lang.ILookup @nodes_ id) .-flow) s f))
+           ((-> (ex/-get*  @nodes_ id) .-flow) s f))
 
          clojure.lang.IRef
          (deref [_]
-           (let [>f (-> (.valAt ^clojure.lang.ILookup @nodes_ id) .-flow)]
-             (mi/reduce (comp reduced {}) nil >f)))
+           (let [>f (-> (ex/-get*  @nodes_ id) .-flow)]
+             (mi/reduce (comp reduced second {}) nil >f)))
          )))
 
    :cljs
    (defn get-node [id]
-     (when (.get @nodes_ id)
+     (when (ex/-get* @nodes_ id)
        (reify id
          INode
-         (dependencies [_]
-           (-> @nodes_ (.get id) .-deps))
+         (-dependencies [_]
+           (-> @nodes_ (ex/-get id) .-deps))
 
          IFn
          (-invoke [_]
-           (.-flow ^Vertex (.get @nodes_ id)))
+           (.-flow ^Vertex (ex/-get* @nodes_ id)))
 
          (-invoke [_ deps]
-           ((.-f ^Vertex (.get @nodes_ id)) id deps))
+           ((.-f ^Vertex (ex/-get* @nodes_ id)) id deps))
 
          (-invoke [_ s f]
-           ((.-flow ^Vertex (.get @nodes_ id)) s f))
+           ((.-flow ^Vertex (ex/-get* @nodes_ id)) s f))
 
          IDeref
          (-deref [_]
-           (let [>f (.-flow ^Vertex (.get @nodes_ id))]
-             (mi/reduce (comp reduced {}) nil >f)))
+           (let [>f (.-flow ^Vertex (ex/-get* @nodes_ id))]
+             (mi/reduce (comp reduced second {}) nil >f)))
          ))))
 
 (defrecord Vertex [id f input deps flow])
@@ -301,7 +290,7 @@
 
 (defn- -link! [id >fs]
   (if-let [vrtx (get-node id)]
-    (mi/signal! (mi/eduction (dedupe) (apply mi/latest (fn [& args] [id (vrtx (into {} args))]) >fs)))
+    (mi/signal! (mi/eduction (dedupe) (ex/-apply mi/latest (fn [& args] [id (vrtx (into {} args))]) >fs)))
     (throw (ex-info (str "node " id " dosen't exists!") {:id id}))))
 
 (defn- -build-graph []
@@ -309,9 +298,9 @@
     (if id
       (if-let [f (some-> vrtx .-flow mi/signal!)]
         (recur more (conj acc f))
-        (let [ks (.-deps vrtx)
+        (let [ks (.-deps ^Vertex vrtx)
               in (mapv (fn [k]
-                         (if-let [>f (some-> @dag (.get k))]
+                         (if-let [>f (some-> @dag (ex/-get k))]
                            (.-flow ^Vertex >f)
                            (throw (ex-info (str "node " id " dosen't exists!") {:id k})))) ks)]
           (if (every? some? in)
@@ -323,17 +312,20 @@
 
 (defn- -process-update-event [e]
   ((mi/sp
-    (let [fs   (mapv (fn [id] (let [^Vertex vrtx (.get @dag id)] (.-flow vrtx))) (dependencies e))
-          r    (mi/? (mi/reduce (comp reduced {}) nil (apply mi/latest (fn [& args] (update e (into {} args))) fs)))]
+    (let [fs   (mapv (fn [id] (let [^Vertex vrtx (ex/-get* @dag id)] (.-flow vrtx))) (-dependencies e))
+          r    (mi/? (mi/reduce (comp reduced {}) nil (ex/-apply mi/latest (fn [& args] (update e (into {} args))) fs)))]
       (if (map? r)
         (-reset-graph-input! dag r)
-        (timbre/errorf "result of UpdateEvent: %s should be a map or missionary ap!, but is %s" (id e) (type r)))))
+        (timbre/errorf "result of UpdateEvent: %s should be a map!, but is %s" (-id e) (type r)))))
    (constantly nil) #(handle-error e %)))
 
 (defn- -process-watch-event [e]
   ((mi/sp
-    (when-let [>f (watch e dag (mi/? stream))]
+    (when-let [>f (watch e dag @stream_)]
       (cond
+        (or (update-event? >f) (watch-event? >f) (effect-event? >f) (custom-event? >f))
+        (mbx >f)
+
         (fn? >f)
         (mi/? (mi/reduce (fn [_ e] (mbx e)) >f))
 
@@ -345,12 +337,12 @@
              (-> >f (.then (fn [s] (dispatch s))) (.catch (fn [err] (handle-error e err))))])
 
         :else
-        (timbre/errorf "result of WatchEvent: %s should be missionary ap! or js/promise, but is: %s" (id e) (type >f)))))
+        (timbre/errorf "result of WatchEvent: %s should be missionary ap! or js/promise, but is: %s" (-id e) (type >f)))))
    (constantly nil) #(handle-error e %)))
 
 (defn- -process-effect-event [e]
   ((mi/sp
-    (when-let [>f (effect e dag (mi/? stream))]
+    (when-let [>f (effect e dag @stream_)]
       (cond
         (fn? >f)
         (mi/stream! >f)
@@ -363,12 +355,12 @@
              (-> >f (.then (constantly nil)) (.catch (fn [err] (handle-error e err))))])
 
         :else
-        (timbre/errorf "result of EffectEvent: %s should be missionary ap! or js/promise, but is: %s" (id e) (type >f)))))
+        (timbre/errorf "result of EffectEvent: %s should be missionary ap! or js/promise, but is: %s" (-id e) (type >f)))))
    (constantly nil) #(handle-error e %)))
 
 (defn add-node!
   ([id x]
-   (when-let [vrtx (.get @dag id)]
+   (when-let [vrtx (ex/-get* @dag id)]
      (timbre/warn "overwriting node id:" id)
      (when-let [>flow (.-flow ^Vertex vrtx)]
        (try (>flow) (catch #?(:clj Exception :cljs :default) _ nil))))
@@ -383,23 +375,23 @@
      :else
      (add-node! id (atom x))))
 
-  ([id deps f]
-   (when-let [vrtx (.get @dag id)]
-     (timbre/warn "overwriting node id:" id)
+  ([-id deps f]
+   (when-let [vrtx (ex/-get* @dag -id)]
+     (timbre/warn "overwriting node id:" -id)
      (when-let [>flow (.-flow ^Vertex vrtx)]
        (try (>flow) (catch #?(:clj Exception :cljs :default) _ nil))))
-   (swap! dag assoc id (-vertex {:id id :f f :deps deps})))
+   (swap! dag assoc -id (-vertex {:id -id :f f :deps deps})))
 
-  ([id deps f >flow]
-   (when-let [vrtx (.get @dag id)]
-     (timbre/warn "overwriting node id:" id)
+  ([-id deps f >flow]
+   (when-let [vrtx (ex/-get* @dag -id)]
+     (timbre/warn "overwriting node id:" -id)
      (when-let [>flow (.-flow ^Vertex vrtx)]
        (>flow)))
-   (swap! @dag assoc id (-vertex {:id id :f f :deps deps :flow >flow}))))
+   (swap! @dag assoc -id (-vertex {:id -id :f f :deps deps :flow >flow}))))
 
 (defn add-watch! [e]
   ((mi/sp
-     (when (mi/? stream)
+    (when @stream_
        (dispatch e)))
    (constantly nil) (constantly nil)))
 
@@ -410,19 +402,19 @@
        EffectEvent
        (effect [e m _]
          (let [deps (cond-> deps (not (seq? deps)) vector)
-               fs   (mapv (fn [id] (or (some-> ^Vertex (.get @dag id) .-flow) id)) deps)]
+               fs   (mapv (fn [-id] (or (some-> ^Vertex (ex/-get* @dag -id) .-flow) -id)) deps)]
            (if-let [missing (seq (persistent!
                                   (reduce
                                    (fn [acc x] (if (publisher? x) acc (conj! acc x)))
                                    (transient [])
                                    fs)))]
              (timbre/errorf "some of deps dosen't exists! %s" missing)
-             (dfv (->> (apply mi/latest (fn [& args] (into {} args)) fs)
+             (dfv (->> (ex/-apply mi/latest (fn [& args] (into {} args)) fs)
                        (mi/eduction (comp (dedupe) (map (fn [dag] (f e dag)))))
                        (mi/stream!))))))))
     (fn []
       ((mi/sp (when-let [>f (mi/? dfv)] (>f)))
-       #(timbre/debugf "successful unlisten %s" deps)
+       #(timbre/debugf "successful unlisten %s" deps %)
        #(timbre/errorf "unsuccessful unlisten %s %s" deps %)))))
 
 #?(:clj
@@ -434,10 +426,10 @@
             lstn (listen! id
                    (fn [_ m]
                      (if #?(:clj (identical? ::none x) :cljs (keyword-identical? ::none x))
-                       (when-not (= (.get m id) @atm_)
-                         (reset! atm_ (.get m id)))
-                       (when-not (= ((.get m id) x) @atm_)
-                         (reset! atm_ ((.get m id) x))))))]
+                       (when-not (= (ex/-get* m id) @atm_)
+                         (reset! atm_ (ex/-get* m id)))
+                       (when-not (= ((ex/-get* m id) x) @atm_)
+                         (reset! atm_ ((ex/-get* m id) x))))))]
         (clojure.core/reify
           clojure.lang.IRef
           (deref [_] @atm_)
@@ -446,17 +438,17 @@
           (invoke [_] (lstn))))))
    :cljs
    (defn value
-     ([id]
-      (value id ::none))
-     ([id x]
+     ([-id]
+      (value -id ::none))
+     ([-id x]
       (let [atm_ (atom nil)
-            lstn (listen! id
+            lstn (listen! -id
                    (fn [_ m]
                      (if #?(:clj (identical? ::none x) :cljs (keyword-identical? ::none x))
-                       (when-not (= (.get m id) @atm_)
-                         (reset! atm_ (.get m id)))
-                       (when-not (= ((.get m id) x) @atm_)
-                         (reset! atm_ ((.get m id) x))))))]
+                       (when-not (= (ex/-get* m -id) @atm_)
+                         (reset! atm_ (ex/-get* m -id)))
+                       (when-not (= ((ex/-get* m -id) x) @atm_)
+                         (reset! atm_ ((ex/-get* m -id) x))))))]
         (cljs.core/reify
           IDeref
           (-deref [_] @atm_)
@@ -468,31 +460,25 @@
    (defn subscribe
      ([id]
       (value id ::none))
-     ([id x]
-      (value id x)))
+     ([-id x]
+      (value -id x)))
 
    :cljs
    (defn subscribe
-     ([id]
-      (subscribe id ::none))
-     ([id m]
+     ([-id]
+      (subscribe -id ::none))
+     ([-id m]
       (let [-m (react/useRef m)
             m' (if (= m (.-current -m)) (.-current -m) m)
             [state set-state!] (react/useState nil)]
-        (when (= :edo.subs/query-data id) (tap> [:subscribe :id id m]))
         (react/useEffect
          (fn []
-           (when (= :edo.subs/query-data id) (tap> [:effect :id id m]))
            (set! (.-current -m) m)
-           (listen! id (fn [_ v]
-                         (when (= :edo.subs/query-data id)
-                           (tap> [:listen :id id :m m])
-                           (tap> [:listen :id id :v (.get v id)])
-                           (tap> [:listen :id id :r ((.get v id) m)]))
+           (listen! -id (fn [_ v]
                          (if (keyword-identical? m ::none)
-                           (set-state! (.get v id))
-                           (set-state! ((.get v id) m))))))
-         #js [(str id) m'])
+                           (set-state! (ex/-get* v -id))
+                           (set-state! ((ex/-get* v -id) m))))))
+         #js [(str -id) m'])
         (cljs.core/reify
           IDeref
           (-deref [_] state)
@@ -501,40 +487,44 @@
 
 (defn run! []
   ((mi/sp
-    (if-not (try (mi/? (mi/timeout 0 reactor)) (catch #?(:clj Exception :cljs :default) _ nil))
+    (if-not @reactor_
       (let [r (mi/reactor
                (let [xs (-build-graph)
                      >e (mi/stream! (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))]
-                 (stream >e)
+                 (vreset! stream_ >e)
                  (reduce (fn [acc >f] (conj acc (mi/stream! >f))) [] xs)
                  (mi/stream! (->> >e (mi/eduction (filter update-event?) (map (fn [e] (-process-update-event e))))))
                  (mi/stream! (->> >e (mi/eduction (filter watch-event?)  (map (fn [e] (-process-watch-event  e))))))
                  (mi/stream! (->> >e (mi/eduction (filter effect-event?) (map (fn [e] (-process-effect-event e))))))))]
-        (reactor (r (constantly nil) #(timbre/error %))))
+        (vreset! reactor_ (r #(timbre/info %) #(timbre/error %))))
       (timbre/error "graph already builded!")))
    (constantly nil) #(timbre/error %)))
 
 (defn dispose! []
   ((mi/sp
-    (when-let [cb (try (mi/? (mi/timeout 0 reactor)) (catch #?(:clj Exception :cljs :default) _ nil))]
-      (cb)))
+    (when-let [cb @reactor_]
+      (cb)
+      (vreset! reactor_ nil)
+      (vreset! stream_ nil)))
    (constantly nil) #(timbre/error %)))
 
 ;; -----------------------------------------
 
 (comment
-  (defnode ::store {:a 1 :b 1 :c 1})
 
   (def cancel (mi/dfv))
+
   (def mbx (mi/mbx))
   (def >f (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))
   (def dispose
     ((mi/reactor
-      (mi/stream! (mi/ap (println :x (mi/?> >f))))
-      (cancel (mi/stream! (mi/seed (range 10)))))
+      (cancel (mi/stream! (mi/ap (println :x (mi/?> >f))))))
      prn prn))
   (mbx 1)
   ((mi/? cancel))
+  (dispose)
+
+  (defnode ::store {:a 1 :b 1 :c 1})
 
   (defnode ::a
     [id {::keys [store]}]
@@ -559,6 +549,7 @@
                            (println :lstn ::c (c {:x 10})))))
 
   (dispatch :a)
+  (lstn)
 
   (def sub (subscribe ::c {:x 100}))
   @sub
@@ -566,6 +557,7 @@
 
   (lstn)
   (dispose!)
+  ((mi/? reactor))
 
   (defupdate ::update-test
     [e {::keys [store]}]
