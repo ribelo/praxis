@@ -2,10 +2,12 @@
   (:refer-clojure :exclude [update run! reify deref])
   #?(:cljs (:require-macros [ribelo.praxis :refer [reify defnode defupdate defproc defeffect]]))
   (:require
-   #?(:clj [clojure.core :as clj] :cljs [cljs.core :as cljs])
+   #?(:clj  [clojure.core :as clj]
+      :cljs [cljs.core :as cljs])
    [taoensso.timbre :as timbre]
    [missionary.core :as mi]
    [ribelo.extropy :as ex]
+   [ribelo.fatum :as f]
    #?(:cljs ["react" :as react])))
 
 ;; * macros
@@ -31,50 +33,73 @@
          (persistent! acc)))))
 
 #?(:clj
-   (defmacro defnode [id vargs & body]
-     (if (seq body)
-       (let [[nid m & more] vargs
-             deps (-parse-input m)]
-         `(do
-            (ribelo.praxis/add-node!
-              ~id ~deps
-              ~(if-not (seq more)
-                 `(fn [~nid ~m]
-                    ~@body)
-                 `(fn [~nid ~m]
-                    (ribelo.extropy/-memoize
-                      (fn ~(vec more)
-                        ~@body)))))))
+   (defmacro defnode [& args]
+     (if (= 2 (count args))
        `(ribelo.praxis/add-node!
-          ~id ~vargs))))
+          ~(nth args 0) ~(nth args 1))
+       (let [id (nth args 0)
+             props (nth args 1)]
+         (if-not (map? props)
+           (let [vargs (nth args 1)
+                 body (drop 2 args)]
+             `(defnode ~id {::memoize? false} ~vargs ~@body))
+           (let [memoize? (ex/-get props ::memoize?)
+                 vargs (nth args 2)
+                 [nid m & more] vargs
+                 deps (-parse-input m)
+                 body (drop 3 args)]
+             `(ribelo.praxis/add-node!
+                ~id ~deps
+                ~(if-not (seq more)
+                   (if memoize?
+                     (f/fail! "memoize only works for nodes that take arguments")
+                     `(fn [~nid ~m]
+                        ~@body))
+                   `(fn [~nid ~m]
+                      ~(if memoize?
+                         `(ribelo.extropy/-memoize
+                            (fn ~(vec more)
+                              ~@body))
+                         `(fn ~(vec more)
+                            ~@body)))))))))))
 
 #?(:clj
    (defmacro defevent [id [_ _ _ & more] & body]
-     `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
-        (reify ~id
-          ~'ribelo.praxis/PNode
-          ~@body))))
+     (let [env (meta &form)
+           timeout (get env ::timeout (ex/-ms 5 :mins))]
+       `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
+          (reify ~id
+            ~'ribelo.praxis/PEvent
+            (~'-timeout [~'_] ~timeout)
+            ~'ribelo.praxis/PNode
+            ~@body)))))
 
 #?(:clj
    (defmacro defupdate [id [e deps & more] & body]
-     `(defevent ~id [~e ~deps nil ~@more]
-        ~'ribelo.praxis/UpdateEvent
-        (ribelo.praxis/update [~e ~deps]
-          ~@body))))
+     (with-meta
+       `(defevent ~id [~e ~deps nil ~@more]
+          ~'ribelo.praxis/UpdateEvent
+          (ribelo.praxis/update [~e ~deps]
+            ~@body))
+       (meta &form))))
 
 #?(:clj
    (defmacro defproc [id [e deps stream & _more :as vargs] & body]
-     `(defevent ~id ~vargs
-        ~'ribelo.praxis/PorcedureEvent
-        (ribelo.praxis/procedure [~e ~deps ~stream]
-                                 ~@body))))
+     (with-meta
+       `(defevent ~id ~vargs
+          ~'ribelo.praxis/PorcedureEvent
+          (ribelo.praxis/proc [~e ~deps ~stream]
+                              ~@body))
+       (meta &form))))
 
 #?(:clj
    (defmacro defeffect [id [e deps stream & _more :as vargs] & body]
-     `(defevent ~id ~vargs
-        ~'ribelo.praxis/EffectEvent
-        (ribelo.praxis/effect [~e ~deps ~stream]
-          ~@body))))
+     (with-meta
+       `(defevent ~id ~vargs
+          ~'ribelo.praxis/EffectEvent
+          (ribelo.praxis/effect [~e ~deps ~stream]
+            ~@body))
+       (meta &form))))
 
 (declare node)
 
@@ -82,6 +107,9 @@
 (def ^:private mbx (mi/mbx))
 (def ^:private <stream (mi/dfv))
 (def ^:private <reactor (mi/dfv))
+
+(defprotocol PEvent
+  (-timeout [_]))
 
 (defprotocol PIdentifiable
   (-id [_]))
@@ -145,10 +173,10 @@
        IFn
        (-invoke [_ k]
          (when (ex/-get* @nodes_ k) (node k)))
-       (-invoke [this k x]
+       (-invoke [_ k x]
          (when-let [n (dag k)]
            (n x)))
-       (-invoke [this k x y]
+       (-invoke [_ k x y]
          (when-let [n (dag k)]
            ((n x) y))))))
 
@@ -156,7 +184,7 @@
   (update [_ dag]))
 
 (defprotocol PorcedureEvent
-  (procedure [_ dag stream]))
+  (proc [_ dag stream]))
 
 (defprotocol EffectEvent
   (effect [_ dag stream]))
@@ -175,22 +203,20 @@
 (defn silent-event? [e]
   (satisfies? SilentEvent e))
 
-(defn event? [e]
-  (or (update-event? e)
-      (procedure-event? e)
-      (effect-event? e)))
+(defn event?
+  ([e]
+   (or (update-event? e)
+       (procedure-event? e)
+       (effect-event? e)
+       (silent-event? e)))
+  ([e id]
+   (and (event? e) (ex/-kw-identical? id (-id e)))))
 
 (defmulti event
   (fn
-    ([e                ] e)
-    ([e _              ] e)
-    ([e _ _            ] e)
-    ([e _ _ _          ] e)
-    ([e _ _ _ _        ] e)
-    ([e _ _ _ _ _      ] e)
-    ([e _ _ _ _ _ _    ] e)
-    ([e _ _ _ _ _ _ _  ] e)
-    ([e _ _ _ _ _ _ _ _] e)))
+    ([e    ] e)
+    ([e _  ] e)
+    ([e _ _] e)))
 
 (defmethod event :default [e]
   (when-not (or (silent-event? e) (and (identifiable? e) (or (ex/-kw-identical? ::listen! (-id e)) (ex/-kw-identical? ::deref (-id e)))))
@@ -202,61 +228,62 @@
   (cond
     (keyword? (ex/-first args))
     (let [<v (mi/dfv)]
-      (mbx [<v (apply event args)])
+      ((mi/sp
+         (when (mi/? <stream)
+           (mbx [<v (apply event args)])))
+       #(constantly nil) (fn [err] (f/fail! (ex/-format "dispatch error! %s" (ex/-first args)) {:err err})))
       <v)
     (vector? (ex/-first args))
     (ex/-loop [e args :let [acc (transient [])]]
       (let [<v (mi/dfv)]
-        (mbx [<v (apply event e)])
+        ((mi/sp
+           (when (mi/? <stream)
+             (mbx [<v (apply event e)])))
+         #(constantly nil) (fn [err] (f/fail! (ex/-format "dispatch error! %s" e) {:err err})))
         (recur (conj! acc <v)))
       (apply mi/join vector (persistent! acc)))))
 
 (defn event-type [e]
   (cond
     (update-event? e) "UpdateEvent"
-    (procedure-event? e)  "PorcedureEvent"
+    (procedure-event? e) "PorcedureEvent"
     (effect-event? e) "EffectEvent"
-    :else             "UnknownEvent"))
+    :else "UnknownEvent"))
 
 (defmulti handle-error (fn [e _err] (-id ^PIdentifiable e)))
 
 (defmethod handle-error :default
   [e err]
-  (timbre/warn "Using default error handler, consider using your own!")
-  (timbre/errorf "%s failure id: %s"
-                 (event-type e)
-                 (-id e))
-  (timbre/error (ex-message err)))
-
+  (when-not (f/isa? err ::silent? true)
+    (timbre/warn "Using default error handler, consider using your own!")
+    (timbre/errorf "%s failure id: %s" (event-type e) (-id e))
+    (timbre/error (ex-message err))))
 
 (defn promise?
   "https://github.com/funcool/potok/blob/master/src/potok/core.cljs#L74"
-  [v]
+  [x]
   #?(:clj false
-     :cljs (or (instance? js/Promise v)
-               (and (goog.isObject v)
-                    (fn? (unchecked-get v "then"))))))
+     :cljs (or (instance? js/Promise x)
+               (and (goog.isObject x)
+                    (fn? (unchecked-get x "then"))))))
 
 (defn publisher?
-  [v]
-  #?(:clj  (instance? missionary.impl.Reactor$Publisher v)
-     :cljs (instance? missionary.impl.Reactor/Publisher v)))
+  [x]
+  #?(:clj  (instance? missionary.impl.Reactor$Publisher x)
+     :cljs (instance? missionary.impl.Reactor/Publisher x)))
 
 (defn dataflow?
-  [v]
-  #?(:clj  (instance? missionary.impl.Dataflow$Dataflow v)
-     :cljs (instance? missionary.impl/Dataflow v)))
+  [x]
+  #?(:clj  (instance? missionary.impl.Dataflow x)
+     :cljs (instance? missionary.impl/Dataflow x)))
 
-(defn event-is? [id e]
-  (and (some? e) (identifiable? e) (ex/-kw-identical? id (-id e))))
+(defn -reset-graph-inputs! [dag m]
+  (ex/-run! (fn [[k v]] (when-let [atm_ (some-> @dag (ex/-get k) .-input)] (reset! atm_ v))) m))
 
-(defn -reset-graph-input! [dag m]
-  (ex/-reduce-kv (fn [_ k v] (when-let [atm_ (-> @dag (ex/-get k) .-input)] (reset! atm_ v))) nil m))
+(defrecord Vertex [id kind f input deps flow])
 
-(defrecord Vertex [id f input deps flow])
-
-(defn- -vertex [{:keys [id f input deps flow]}]
-  (->Vertex id f input deps flow))
+(defn- -vertex [{:keys [id kind f input deps flow]}]
+  (->Vertex id kind f input deps flow))
 
 #?(:clj
    (defn node [id]
@@ -299,18 +326,18 @@
 (defn- -link! [id >fs]
   (if-let [vrtx (node id)]
     (mi/signal! (mi/eduction (dedupe) (apply mi/latest (fn [& args] [id (vrtx (into {} args))]) >fs)))
-    (throw (ex-info (str "node " id " dosen't exists!") {:id id}))))
+    (f/fail! (ex/-format "node %s dosen't exists!" id) {:id id})))
 
 (defn- -build-graph! []
   (loop [[[id vrtx] & more] @dag acc []]
     (if id
-      (if (some-> vrtx .-input)
-        (recur more (conj acc (mi/signal! (.-flow vrtx))))
+      (if (or (ex/-kw-identical? :atom (.-kind vrtx)) (ex/-kw-identical? :value (.-kind vrtx)))
+        (recur more (conj acc (mi/signal! (.-flow ^Vertex vrtx))))
         (let [ks (.-deps ^Vertex vrtx)
               in (mapv (fn [k]
                          (if-let [x (some-> @dag (ex/-get k))]
                            (.-flow ^Vertex x)
-                           (throw (ex-info (str "node " id " dosen't exists!") {:id k})))) ks)]
+                           (f/fail! (ex/-format "node %s dosen't exists!" k) {:id k}))) ks)]
           (if (every? some? in)
             (let [>f (-link! id in)]
               (swap! dag assoc-in [id :flow] >f)
@@ -325,116 +352,92 @@
 (defn -maybe-assign [<dfv v]
   (when <dfv (<dfv v)))
 
-(defn- -process-update-event [<dfv e]
+(defn -process-flow [>f ms]
+  (mi/sp
+    (let [xs (mi/? (mi/reduce (fn [acc x] (conj acc x)) [] >f))
+          dfvs (ex/-loop [x xs :let [acc (transient [])]]
+                 (let [<v (mi/dfv)]
+                   (cond
+                     (or (event? x) (promise? x))
+                     (do (mbx [<v x]) (recur (conj! acc <v)))
+
+                     (fn? x)
+                     (do (<v (-process-flow x ms)) (recur (conj! acc <v)))
+
+                     :else
+                     (do (<v x) (recur (conj! acc <v)))))
+                 (persistent! acc))]
+      (mi/? (mi/timeout (apply mi/join vector dfvs) ms (f/fail "timeout!"))))))
+
+(defn- -process-update-event [<r e]
   ((mi/sp
      (when-let [<f (update e dag)]
        (if (fn? <f)
          (when-let [x (mi/? <f)]
            (if (map? x)
-             (-reset-graph-input! dag x)
-             (timbre/errorf "result of UpdateEvent sp: %s should be a map!, but is %s" (-id e) (type x))))
-         (timbre/errorf "result of UpdateEvent: %s should be a sp!, but is %s" (-id e) (type <f)))))
-   #(-maybe-assign <dfv true) #(do (handle-error e %) (-maybe-assign <dfv false))))
+             (-reset-graph-inputs! dag x)
+             (timbre/errorf "result of %s - UpdateEvent task should be a map!, but is %s" (-id e) (type x))))
+         (timbre/errorf "result of %s - UpdateEvent should be a missionary task, but is %s" (-id e) (type <f)))))
+   (fn [_] (-maybe-assign <r true)) (fn [err] (-maybe-assign <r (f/fail (ex-message err))) (handle-error e err))))
 
 (defn- -process-procedure-event [<r e]
   ((mi/sp
-     (when-let [>f (procedure e dag (mi/? <stream))]
-       (cond
-         (or (event? >f) (promise? >f))
-         (mbx [<r >f])
-
-         (fn? >f)
-         (let [xs (mi/? (mi/reduce (fn [acc x] (conj acc x)) [] >f))
-               dfvs (persistent!
-                      (ex/-reduce
-                        (fn [acc x]
-                          (let [<v (mi/dfv)]
-                            (if (or (event? x) (promise? x))
-                              (do (mbx [<v x]) (conj! acc <v))
-                              (do (<v x) (conj! acc <v)))))
-                        (transient [])
-                        xs))
-               xs' (mi/? (mi/timeout (apply mi/join vector dfvs) (ex/-ms 1 :min) ::timeout))]
-           (if-not (ex/-kw-identical? ::timeout xs')
-             (-maybe-assign <r (if (= 1 (ex/-count* xs')) (ex/-first xs') xs'))
-             (do (-maybe-assign <r false) (handle-error e (ex-info "timeout!" {})))))
-
-         (publisher? >f)
-         (-maybe-assign <r true)
-
-         (dataflow? >f)
-         (-maybe-assign <r (mi/? >f))
-
-         :else
-         (timbre/errorf "result of PorcedureEvent: %s should be event, missionary ap! or js/promise, but is: %s" (-id e) (type >f)))))
-   (constantly nil) #(do (-maybe-assign <r false) (handle-error e %))))
+     (when-let [>f (proc e dag (mi/? <stream))]
+       (if (fn? >f)
+         (-> (mi/? (-process-flow >f (-timeout e)))
+             (f/then (fn [ok] (-maybe-assign <r (if (= 1 (ex/-count ok)) (ex/-first ok) ok))))
+             (f/catch (fn [err] (-maybe-assign <r err) (handle-error e err))))
+         (timbre/errorf "result of PorcedureEvent: %s should be event, missionary flow, but is: %s" (-id e) (type >f)))))
+   (constantly nil) (fn [err] (-maybe-assign <r (f/fail (ex-message err) (ex-data err))) (handle-error e err))))
 
 (defn- -process-effect-event [e]
   ((mi/sp
-     (mi/stream! (effect e dag (mi/? <stream))))
-   (constantly nil) #(handle-error e %)))
+     (mi/? (mi/reduce (constantly nil) (effect e dag (mi/? <stream)))))
+   (constantly nil) (fn [err] (handle-error e err))))
 
 #?(:cljs
    (defn- -process-promise [<r ^js e]
      ((mi/sp
         (let [<v (mi/dfv)]
-          (-> e (.then (fn [ok] (<v (fn [] ok)))) (.catch (fn [err] (<v (fn [] (throw err))))))
-          (when-let [x (mi/? (mi/absolve <v))]
+          (-> e
+              (.then (fn [ok] (<v ok)))
+              (.catch (fn [err] (<v (f/fail (ex-message err) (ex-data err))) (timbre/errorf "error in promise %s" err)))) ;
+          (when-let [x (mi/? <v)]
             (cond
               (or (event? x) (promise? x))
               (mbx [<r x])
 
               (fn? x)
-              (let [xs (mi/? (mi/reduce (fn [acc x] (conj acc x)) [] x))
-                    dfvs (persistent!
-                           (ex/-reduce
-                             (fn [acc x]
-                               (let [<v (mi/dfv)]
-                                 (if (or (event? x) (promise? x))
-                                   (do (mbx [<v x]) (conj! acc <v))
-                                   (do (<v x) (conj! acc <v)))))
-                             (transient [])
-                             xs))
-                    xs' (mi/? (mi/timeout (apply mi/join vector dfvs) (ex/-ms 1 :min) ::timeout))]
-                (if-not (ex/-kw-identical? ::timeout xs')
-                  (-maybe-assign <r (if (= 1 (ex/-count* xs')) (ex/-first xs') xs'))
-                  (do (-maybe-assign <r false) (handle-error e (ex-info "timeout!" {})))))
+              (<r (mi/? (-process-flow x (ex/-ms* 5 :mins))))
 
-              (publisher? x)
-              (-maybe-assign <r true)
+              (dataflow? x)
+              (<r (mi/? x))
 
               :else
               (<r x)))))
-      (constantly nil) #(do (<r %) (timbre/errorf "error in promise %s" %)))))
+      (constantly nil) (constantly nil))))
+
+(defn -process-event [<r e]
+  (when (update-event? e) (-process-update-event <r e))
+  (when (procedure-event? e) (-process-procedure-event <r e))
+  (when (effect-event? e) (-process-effect-event e))
+  #?(:cljs (when (promise? e) (-process-promise <r e))))
 
 (defn add-node!
   ([id x]
-   (tap> [:node :a id x (type x)])
    ((mi/sp
-      (cond
-        (instance? #?(:clj clojure.lang.Atom :cljs Atom) x)
+      (if (instance? #?(:clj clojure.lang.Atom :cljs Atom) x)
         (let [>flow (mi/eduction (comp (map (fn [x] [id x])) (dedupe)) (mi/watch x))]
-          (swap! dag assoc id (-vertex {:id id :flow >flow :input x})))
-
-        (fn? x)
-        (swap! dag assoc id (-vertex {:id id :flow x}))
-
-        :else
+          (swap! dag assoc id (-vertex {:id id :kind :atom :flow >flow :input x})))
         (let [atm_ (atom x)
               >flow (mi/eduction (comp (map (fn [x] [id x])) (dedupe)) (mi/watch atm_))]
-          (swap! dag assoc id (-vertex {:id id :flow >flow :input atm_}))))
+          (swap! dag assoc id (-vertex {:id id :kind :value :flow >flow :input atm_}))))
       (when (mi/? <reactor) (dispatch ::build-graph!)))
     #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %)))
 
   ([id deps f]
    ((mi/sp
-      (swap! dag assoc id (-vertex {:id id :f f :deps deps}))
-      (when (mi/? <reactor) (dispatch ::build-graph!)))
-    #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %)))
-
-  ([id deps f >flow]
-   ((mi/sp
-      (swap! @dag assoc id (-vertex {:id id :f f :deps deps :flow >flow}))
+      (swap! dag assoc id (-vertex {:id id :kind :fn :f f :deps deps}))
       (when (mi/? <reactor) (dispatch ::build-graph!)))
     #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %))))
 
@@ -450,9 +453,8 @@
     EffectEvent
     (effect [_ _ _]
       (if-let [>flow (some-> ^Vertex (ex/-get @dag id) .-flow)]
-        (->> (mi/eduction (comp (dedupe) (map (fn [[e v]] (f e v)))) >flow)
-             (mi/stream!))
-        (throw (ex-info (ex/-format "node %s dosen't exists!" id) {:id id}))))))
+        (mi/stream! (mi/eduction (comp (dedupe) (map (fn [[e v]] (f e v)))) >flow))
+        (f/fail! (ex/-format "node %s dosen't exists!" id) {:id id})))))
 
 (defn listen! [id f]
   (let [<v (dispatch ::listen! id f)]
@@ -505,18 +507,8 @@
                  (let [>e (mi/stream! (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))]
                    (<stream >e)
                    (mi/stream! (->> >e (mi/eduction
-                                         (filter (fn [[_ e]] (and (update-event? e) (not (silent-event? e)))))
-                                         (map (fn [[<dfv e]] (-process-update-event <dfv e))))))
-                   (mi/stream! (->> >e (mi/eduction
-                                         (filter (fn [[_ e]] (and (procedure-event? e) (not (silent-event? e)))))
-                                         (map (fn [[<dfv e]] (-process-procedure-event <dfv e))))))
-                   (mi/stream! (->> >e (mi/eduction
-                                         (filter (fn [[_ e]] (and (effect-event? e) (not (silent-event? e)))))
-                                         (map (fn [[_ e]] (-process-effect-event e))))))
-                   #?(:cljs
-                      (mi/stream! (->> >e (mi/eduction
-                                            (filter (fn [[_ e]] (promise? e)))
-                                            (map (fn [[<dfv e]] (-process-promise <dfv e)))))))))]
+                                         (filter (fn [[_ e]] (not (silent-event? e))))
+                                         (map (fn [[<r e]] (-process-event <r e))))))))]
          (<reactor (r #(timbre/infof "succesfuly shutdown reactor" %) #(timbre/error %))))
        (timbre/warn "graph already builded!")))
    (constantly nil) #(timbre/error %)))
@@ -533,13 +525,14 @@
   [_ dag _ id]
   (mi/ap
     (if-let [node (ex/-get* dag id)]
+      (tap> (mi/? node))
       (tap> (str "node '" id "' dosen't exists!")))))
 
 (defeffect ::prn-node
   [_ dag _ id]
   (mi/ap
     (if-let [node (ex/-get* dag id)]
-      (prn (mi/? node))
+      (prn id (mi/? node))
       (prn (str "node '" id "' dosen't exists!")))))
 
 
@@ -577,10 +570,17 @@
     (println :eval-node :id id :val (:b store))
     (:b store))
 
-  (defnode ::c
-    [id {::keys [a b]} {:keys [x]}]
-    (println :inside id (+ a b x))
-    (+ a b x))
+  (defnode ::c (mi/latest vector (mi/signal! (mi/ap (loop [i 0] (mi/? (mi/sleep 1000)) (mi/amb> i (recur (inc i))))))))
+
+  (defnode ::d
+    [id {::keys [c]}]
+    (* 10 c))
+
+  (mi/? (ex/-get dag ::d))
+  (mi/? (mi/sp (prn :a (mi/?< (.-flow (ex/-get @dag ::c))))))
+  (mi/? (mi/sp (prn :a (mi/? (mi/reduce (comp reduced{}) nil (mi/ap (mi/amb> 1 2 3 4)))))))
+
+  (dispatch ::prn-node ::d)
 
   (run!)
   (def lstn (listen! ::c (fn [e {::keys [c]}]
@@ -601,10 +601,12 @@
 
   (defupdate ::update-test
     [e {::keys [store]}]
-    (println :update-test store)
-    {::store {:a (rand-int 10) :b (rand-int 10) :c (rand-int 10)}})
+    (mi/sp
+      (println :update-test (mi/? store))
+      {::store {:a (rand-int 10) :b (rand-int 10) :c (rand-int 10)}}))
 
   (dispatch ::update-test)
+  @dag
 
   (defeffect ::effect-test
     [e {::keys [store]} _]
