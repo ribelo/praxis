@@ -1,0 +1,5 @@
+#+TITLE: Readme
+
+* πρᾶξις
+
+a [[https://github.com/leonoel/missionary/][missionary]] based incremental computation framework for =clojure= & =clojurescript=.
