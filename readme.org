@@ -1,4 +1,5 @@
 #+TITLE: Readme
+#+OPTIONS: toc:nil
 
 * πρᾶξις
 
