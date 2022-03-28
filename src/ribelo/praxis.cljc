@@ -1,6 +1,6 @@
 (ns ribelo.praxis
   (:refer-clojure :exclude [update run! reify])
-  #?(:cljs (:require-macros [ribelo.praxis :refer [if-clj reify defnode defupdate deftask defflow defstream]]))
+  #?(:cljs (:require-macros [ribelo.praxis :refer [reify defnode defupdate deftask defflow defstream]]))
   (:require
    #?(:clj  [clojure.core :as core]
       :cljs [cljs.core :as core])
@@ -27,8 +27,8 @@
 (deftype CacheEntry [udt v])
 
 (defn -memoize
-  "faster than [[clojure.core/memoize]], but `f` can takes only one argument,
-  supports `ttl`"
+  "faster than [[clojure.core/memoize]], but `f` can takes only one argument and
+  support `ttl`"
   ([f]
    (let [cache_ (volatile! {})]
      (fn
@@ -60,15 +60,15 @@
      "like [[clojure.core/reify]], but the first argument should be a unique
   `keyword` that will be used to identify the `event`"
      ([id & impls]
-      `('core/reify
+      `(core/reify
          ~'ribelo.praxis/Event
-         (~'event-id [~'_] ~id)
-         ~@impls))))
+         (event-id [~'_] ~id)
+        ~@impls))))
 
 #?(:clj
    (defn- -parse-input
      "parses the `map` `m` and extracts all namespaced and unnamespaced keys.
-  supports both format, `{:keys [x y z]}` and `{v :k}` format"
+  supports both format, `{::keys [x y z]}` and `{v :k}` format"
      [m]
      (when (map? m)
        (loop [[[k v] & more] m acc (transient [])]
@@ -86,63 +86,72 @@
 
      "defines the computational graph [[Node]].
 
-[[Node]] can be a single static value, a variable that supports `add-watch`, or
-  a `function`
 
-`function` [[Node]] may have dependencies on other `nodes`. calculations are
+  [[Node]] can be a single static value, a variable that supports `add-watch`,
+  or a `function`
+
+
+  `function` [[Node]] may have dependencies on other `nodes`. calculations are
   incremental and a [[Node]] is recalculated only when dependencies change.
 
-  see also [[add-node!]]"
-     [& args]
-     (assert (> (count args) 1) "defnode take at least two argument")
+
+  see also [[-add-node!]]"
+     [id & args]
+     (assert (keyword? id) "id should be keyword")
+     (assert (pos? (count args)) "defnode take at least two arguments")
      (let [env (meta &form)]
-       (if (= 2 (count args))
+       (if (= 1 (count args))
          ;; add static node
-         `(ribelo.praxis/add-node!
-            ~(nth args 0) ~(nth args 1))
+         `(emit! ::add-node! {:id ~id :value ~(nth args 0)})
          ;; add dynamic node
          (let [memoize? (boolean (or (::memoize? env) (::ttl env)))
                ttl (::ttl env)
-               id (nth args 0)
-               vargs (nth args 1)
+               vargs (nth args 0)
                [nid m & more] vargs
                deps (-parse-input m)
                body (drop 2 args)]
            (assert (or (nil? ttl) (and (number? ttl) (pos? ttl))) "ttl must be a positive number")
-           (assert (= 1 (count more)) "defnode can only take one additional argument, use map if you need to pass multiple parameters")
+           (assert (<= (count more) 1) "defnode can only take one additional argument, use map if you need to pass multiple parameters")
            (let [params (first more)]
-             `(ribelo.praxis/add-node!
-                ~id ~deps
-                ~(if-not params
-                   (do (assert memoize? "memoize only works for nodes that take argument")
-                       `(fn [~nid ~m]
-                          ~@body))
-                   (let [inner-fn `(fn [~nid ~m ~params] ~@body)]
-                     `(fn [~nid ~m]
-                        ~(if memoize?
-                           (if ttl
-                             `(-memoize ~ttl ~inner-fn)
-                             `(-memoize ~inner-fn))
-                           inner-fn)))))))))))
+             `(emit! ::add-node!
+                {:id ~id
+                 :deps ~deps
+                 :f ~(if-not params
+                       (do (assert (not memoize?) "memoize only works for nodes that take aditional argument")
+                           `(fn [~nid ~m]
+                              ~@body))
+                       (let [inner-fn `(fn [~nid ~m ~params] ~@body)]
+                         `(fn [~nid ~m]
+                            ~(if memoize?
+                               (if ttl
+                                 `(-memoize ~ttl ~inner-fn)
+                                 `(-memoize ~inner-fn))
+                               inner-fn))))})))))))
 
 #?(:clj
    (defmacro defevent
 
-     "declares an event method.
+     "declares an [[event]] method.
+
 
   the macro underneath creates an [[event]] method for the `id` returning a
   [[reify]] that supports the [[Event]] protocol.
 
+
   supports `::silent` and `::in-reactor-context` metadata, see [[SilentEvent]]
-  and [[ReactorEvent]]
+  and [[ReactorContext]]
   "
      [id & args]
+     (assert (keyword? id) "id should be keyword")
      (let [env (meta &form)
-           [[_ _ _ & more] & body] (if (string? (first args)) (drop 1 args) args)]
+           [[_ deps _ & more] & body] (if (string? (first args)) (drop 1 args) args)]
        `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
           (reify ~id
+            (dependencies [~'this] ~(or (::dependencies env) (-parse-input deps)))
             ~@(when (::in-reactor-context env)
-                `(~'ribelo.praxis/ReactorEvent))
+                `(~'ribelo.praxis/ReactorContext))
+            ~@(when (::custom env)
+                `(~'ribelo.praxis/CustomEvent))
             ~@(when (::silent env)
                 `(~'ribelo.praxis/SilentEvent))
             ~@body)))))
@@ -152,80 +161,97 @@
      "like [[defevent]] creates an [[event]] defmethod that returns [[reify]] where the body is
   unrolled as the [[update]] function body of [[UpdateEvent]] protocol.
 
+
   see also `[[UpdateEvent]]`
   "
      [id & args]
+     (assert (keyword? id) "id should be keyword")
      (let [env (meta &form)
            [[e deps & more] & body] (if (string? (first args)) (drop 1 args) args)]
-       (with-meta
-         `(defevent ~id [~e ~deps nil ~@more]
-            ~'ribelo.praxis/Event
+       `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
+          (reify ~id
             (dependencies [~'this] ~(or (::dependencies env) (-parse-input deps)))
+            ~@(when (::silent env)
+                `(~'ribelo.praxis/SilentEvent))
             ~'ribelo.praxis/UpdateEvent
-            (ribelo.praxis/update [~e ~deps] ~@body))
-         env))))
+            (ribelo.praxis/update [~e ~deps] ~@body))))))
 
 #?(:clj
    (defmacro deftask
      "declaration `task` [[event]].
 
+
   like [[defevent]] underneath creates an [[event]] `method` that returns [[reify]]
   where the body is unrolled as the `task` function body of [[TaskEvent]]
   protocol. must return `missionary.core/Sequential`.
 
-  see also [[TaskEvent]]
-"
+
+  see also [[TaskEvent]]"
      [id & args]
+     (assert (keyword? id) "id should be keyword")
      (let [env (meta &form)
            [[e deps & more] & body] (if (string? (first args)) (drop 1 args) args)]
-       (with-meta
-         `(defevent ~id [~e ~deps ~'_ ~@more]
-            ~'ribelo.praxis/Event
+       `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
+          (reify ~id
             (dependencies [~'this] ~(or (::dependencies env) (-parse-input deps)))
+            ~@(when (::in-reactor-context env)
+                `(~'ribelo.praxis/ReactorContext))
+            ~@(when (::custom env)
+                `(~'ribelo.praxis/CustomEvent))
+            ~@(when (::silent env)
+                `(~'ribelo.praxis/SilentEvent))
             ~'ribelo.praxis/TaskEvent
-            (ribelo.praxis/task [~e ~deps] ~@body))
-         env))))
+            (ribelo.praxis/task [~e ~deps] ~@body))))))
 
 #?(:clj
    (defmacro defflow
      "declaration `flow` [[event]].
 
+
   like [[defevent]] creates an [[event]] `method` that returns [[reify]] where the body is
   unrolled as the `flow` function body of [[FlowEvent]] protocol.
 
-  check [[FlowEvent]]
-"
+
+  check [[FlowEvent]]"
      [id & args]
+     (assert (keyword? id) "id should be keyword")
      (let [env (meta &form)
            [[e deps & more] & body] (if (string? (first args)) (drop 1 args) args)]
-       (with-meta
-         `(defevent ~id [~e ~deps ~'_ ~@more]
-            ~'ribelo.praxis/Event
+       `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
+          (reify ~id
             (dependencies [~'this] ~(or (::dependencies env) (-parse-input deps)))
+            ~@(when (::in-reactor-context env)
+                `(~'ribelo.praxis/ReactorContext))
+            ~@(when (::custom env)
+                `(~'ribelo.praxis/CustomEvent))
+            ~@(when (::silent env)
+                `(~'ribelo.praxis/SilentEvent))
             ~'ribelo.praxis/FlowEvent
-            (ribelo.praxis/flow [~e ~deps] ~@body))
-         env))))
+            (ribelo.praxis/flow [~e ~deps] ~@body))))))
 
 #?(:clj
    (defmacro defstream
      "declaration `stream` [[event]].
 
+
   underneath creates an [[event]] `method` that returns [[reify]] where the body is
   unrolled as the `flow` function body of [[FlowEvent]] protocol and execution is
   performed in reactor context.
 
-  check [[FlowEvent]], [[ReactorContext]]
-"
+
+  check [[FlowEvent]], [[ReactorContext]]"
      [id & args]
+     (assert (keyword? id) "id should be keyword")
      (let [env (meta &form)
            [[e deps stream & more] & body] (if (string? (first args)) (drop 1 args) args)]
-       (with-meta
-         `(defevent ~id [~e ~deps ~stream ~@more]
-            ~'ribelo.praxis/Event
+       `(defmethod ~'ribelo.praxis/event ~id ~(into ['id] more)
+          (reify ~id
             (dependencies [~'this] ~(or (::dependencies env) (-parse-input deps)))
+            ~'ribelo.praxis/ReactorContext
+            ~@(when (::silent env)
+                `(~'ribelo.praxis/SilentEvent))
             ~'ribelo.praxis/FlowEvent
-            (ribelo.praxis/flow [~e ~deps ~stream] ~@body))
-         env))))
+            (ribelo.praxis/flow [~e ~deps ~stream] ~@body))))))
 
 (declare node)
 
@@ -235,11 +261,11 @@
 
 (defprotocol Event
   "basic protocol to distinguish between events and non-events"
+  (event-id [_]
+    "returns `event-id`, nothing more nothing less")
   (dependencies [_]
     "a sequence of dependencies in the form of keys referring to the `id` of
-    `nodes`")
-  (event-id [_]
-    "returns `event-id`, nothing more nothing less"))
+    `nodes`"))
 
 #?(:clj
    (defrecord Node [id kind f input deps flow]
@@ -265,9 +291,7 @@
 #?(:clj
    (def dag
      "the whole body of the `graph`. it is a proxy for the private [[nodes_]] atom to
-  make sure we don't hurt ourselves by directly manipulating it
-
-  "
+  make sure we don't hurt ourselves by directly manipulating it"
      (core/reify
        clojure.lang.ILookup
        (valAt [_ k]
@@ -275,11 +299,7 @@
 
        clojure.lang.IRef
        (core/deref [_]
-         (persistent!
-          (reduce
-           (fn [acc [k ^Node vrtx]] (assoc! acc k (.-flow vrtx)))
-           (transient {})
-           @nodes_)))
+         @nodes_)
 
        clojure.lang.IFn
        (invoke [_ k]
@@ -301,11 +321,7 @@
 
        IDeref
        (-deref [_]
-         (persistent!
-          (reduce
-           (fn [acc [k ^Node node]] (assoc! acc k (.-flow node)))
-           (transient {})
-           @nodes_)))
+         @nodes_)
 
        IFn
        (-invoke [_ k]
@@ -344,9 +360,12 @@
     `map` is replaced by the [[dag]] itself."))
 
 (defprotocol SilentEvent
+  "protocol that allows you to mute default error handler")
+
+(defprotocol CustomEvent
   "protocol that allows you to bypass [[event]] execution. bypassing allows you to
   handle it yourself using another [[FlowEvent]] and `filter` it in the
-  [[event]] `stream`.")
+  `event stream`.")
 
 (defprotocol ReactorContext
   "protocol to force [[event]] handling inside the `reactor context`. causes the
@@ -373,6 +392,11 @@
   [e]
   (satisfies? SilentEvent e))
 
+(defn custom-event?
+  "checks if the [[event]] `e` implements [[CustomEvent]]"
+  [e]
+  (satisfies? CustomEvent e))
+
 (defn reactor-context-event?
   "checks if the [[event]] `e` implements [[ReactorContext]]"
   [e]
@@ -388,6 +412,7 @@
   "checks if `x` is `js/Promise`, for obvious reasons, in `clj` always returns
   false
 
+
   shamelessly stolen from
   https://github.com/funcool/potok/blob/master/src/potok/core.cljs#L74"
   [x]
@@ -399,12 +424,13 @@
 (defn -watchable?
   "checks if `x` support `add-watch`"
   [x]
-  #?(:clj  (satisfies? clojure.lang.IRef x)
+  #?(:clj  (instance? clojure.lang.IRef x)
      :cljs (satisfies? cljs.core.IWatchable x)))
 
 (defn event?
   "checks if `e` implements the [[Event]] protocol, when `id` is also given,
   checks furthermore if the [[event-id]] is identical to the `id`.
+
 
   can be used to filter [[SilentEvent]] from the `event stream`"
   ([e]
@@ -414,9 +440,8 @@
 
 (defmulti event
   "declare an event, should return a [[reify]] that supports the [[Event]]
-  protocol, however, any value can be added to the `stream` but will not be
-  handled. you have to handle yourself. for flexibility supports up to four
-  arguments, if you need more you should really consider using map"
+  protocol. for flexibility supports up to four arguments, if you need more you
+  should really consider using map"
   (fn
     ([e        ] e)
     ([e _      ] e)
@@ -425,52 +450,48 @@
     ([e _ _ _ _] e)))
 
 (defmethod event :default [e]
-  (f/thru-if e
-    (fn [e] (not (or (silent-event? e) (event? e ::listen!))))
-    (fn [e] (timbre/warnf "Using default event handler for %s, returning value as is, consider adding own method!"
-                          (if (event? e) (event-id e) e)))))
+  (if (keyword? e)
+    (f/fail "event don't exists" {:id 1})
+    (f/fail "event must be a keyword" {:type (type e)})))
+
+(defn -ensure-event
+  [e & args]
+  (prn :ensure e args)
+  (cond
+    (keyword? e) (apply event e args)
+    (and (event? e) (empty? args)) e
+    :else
+    (f/fail "event must be keyword or something that implements the Event protocol")))
+
 (defn emit
   "[pure] adds an [[event]] or a sequence of events to the `event stream`.
   the [[event]] can be either a [[reify]] implements [[Event]] protocol, or a
-  `keyword` identifying an [[event]] `method`, however, any value can be
-  `emited` to the `stream` but will not be handled, you have to handle yourself.
+  `keyword` identifying an [[event]] `method`.
+
 
   returns a `flow` containing the data produced by the individual [[reify]]
   functions, or `stream` if the event implements [[ReactorContext]]. [[reify]]
   functions are executed in the order: `update`, `task`, `flow` and results is
   returned in that order."
-  [& args]
+  [e & args]
   (mi/ap
-   (when (mi/? <reactor)
-     (cond
-       (keyword? (first args))
-       (let [<v (mi/dfv)]
-         (mbx [<v (apply event args)])
-         (let [x (mi/? <v)]
-           (if (and (fn? x) (not (-publisher? x)))
-             (mi/?> x)
-             x)))
+   (cond
+     (or (keyword? e) (event? e))
+     (f/when-ok [<v (mi/dfv)
+                 e' (apply -ensure-event e args)]
+       (mbx [<v e'])
+       (f/when-ok [x (mi/? <v)]
+         (if (and (fn? x) (not (-publisher? x)))
+           (mi/?> x)
+           x)))
 
-       (sequential? (first args))
-       (let [e (mi/?> (mi/seed args))
-             <v (mi/dfv)]
-         (mbx [<v (apply event e)])
-         (let [x (mi/? <v)]
-           (if (and (fn? x) (not (-publisher? x)))
-             (mi/?> x)
-             x)))
-
-       :else
-       (let [e (mi/?> (mi/seed args))
-             <v (mi/dfv)]
-         (mbx [<v e])
-         (let [x (mi/? <v)]
-           (if (and (fn? x) (not (-publisher? x)))
-             (mi/?> x)
-             x)))))))
+     (sequential? e)
+     (let [e (mi/?> (mi/seed (into [e] args)))]
+       (mi/reduce conj (apply emit e))))))
 
 (defn emit!
   "calls the [[emit]] and immediately `reduce` the returned `flow`
+
 
   returns `dataflow` containing the result of the reduction. if the result of
   the reduction contains only one element, that element is returned itself."
@@ -478,23 +499,33 @@
   (let [v (mi/dfv)]
     ((mi/reduce conj (apply emit args)) (fn [ok] (v ok)) (fn [err] (v err)))
     (mi/sp
-     (let [x (mi/? v)]
+     (f/when-ok [x (mi/? v)]
        (or (and (= 1 (count x)) (first x)) x)))))
 
 (defmulti handle-error
   "allows the automatic handling of errors arising as a result of protocol
-  function calls"
+  function calls
+
+  a more functional approach to error handling. "
   (fn [e _err] (when (event? e) (event-id ^Event e))))
 
 (defmethod handle-error :default
-  [_e err]
+  [e err]
+  (when-not (silent-event? e)
+    (timbre/error (ex-message e)))
   err)
 
 (defn -reset-graph-inputs!
   "resets the atoms holding the values of the static nodes of the dag"
   [m]
-  (core/run! (fn [[k v]] (when-let [atm_ (get-in @nodes_ k :input)] (reset! atm_ v))) m)
-  true)
+  (persistent!
+   (reduce-kv
+    (fn [acc k v]
+      (let [atm_ (get-in @nodes_ [k :input])]
+        (reset! atm_ v)
+        (assoc! acc k @atm_)))
+    (transient {})
+    m)))
 
 (defn- -link!
   "creates an edge between the nodes of the graph"
@@ -510,7 +541,7 @@
     (if id
       (if (or (-kw-identical? :watchable (.-kind node)) (-kw-identical? :static (.-kind node)))
         (recur more (conj acc (mi/signal! (.-flow node))))
-        (let [ks (:deps node)
+        (let [ks (.-deps node)
               in (mapv (fn [k]
                          (if-let [x (@nodes_ k)]
                            (.-flow ^Node x)
@@ -548,9 +579,9 @@
 
 (defn- -process-update-event
   "handles all [[UpdateEvent]] that are not [[SilentEvent]]"
-  [^Event e m]
+  [e m]
   (mi/sp
-   (when-some [?task (update (event-id e) m)]
+   (when-some [?task (update e m)]
      (if (fn? ?task)
        (-> (f/attempt (mi/? ?task))
            (f/fail-if (complement map?) "UpdateEvent task should be a map" {:id (event-id e)})
@@ -565,7 +596,7 @@
 
 (defn- -process-task-event
   "handles all [[TaskEvent]] that are not [[SilentEvent]]"
-  [^Event e m]
+  [e m]
   (mi/sp
    (when-some [?task (task e m)]
      (if (fn? ?task)
@@ -580,7 +611,7 @@
 
 (defn- -process-flow-event
   "handles all [[FlowEvent]] that are not [[SilentEvent]]"
-  [^Event e m stream]
+  [e m stream]
   (mi/ap
    (when-some [?flow (if (reactor-context-event? e) (flow e m stream) (flow e m))]
      (if (fn? ?flow)
@@ -608,37 +639,61 @@
               (f/catch (fn [err] (f/fail (ex-message err) (assoc (ex-data err) :type ::promise-event))))
               (f/thru-if (every-pred f/fail? (complement (comp ::silent?))) (fn [err] (timbre/error (ex-message err) (ex-data err))))))))))
 
-(defn add-node!
+(defn -add-node!
   "[inpure] adds a node to the graph, prefer using [[defnode]]
 
+
   `id` should be a unique `keyword`, preferably namespaced
+
   `deps` should be a collection of `id` referring to other nodes
+
   `f` should by should be a function that takes as first paramter an `id`, second
   an map with resolved dependencies, the optional third argument can be anything, if
   you need to pass more variables use a map"
   ([id x]
-   ((mi/sp
-     (if (-watchable? x)
-       (let [>flow (mi/eduction (comp (map (fn [x] [id x])) (dedupe)) (mi/watch x))]
-         (swap! nodes_ assoc id (-node {:id id :kind :watchable :flow >flow :input x})))
-       (let [atm_ (atom x)
-             >flow (mi/eduction (comp (map (fn [x] [id x])) (dedupe)) (mi/watch atm_))]
-         (swap! nodes_ assoc id (-node {:id id :kind :static :flow >flow :input atm_}))))
-     (when (mi/? <reactor) (emit! ::build-graph!)))
-    #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %)))
+   (let [<v (mi/dfv)]
+     ((mi/sp
+       (if (-watchable? x)
+         (let [>flow (mi/eduction (comp (map (fn [x] [id x])) (dedupe)) (mi/watch x))
+               node (-node {:id id :kind :watchable :flow >flow :input x})]
+           (swap! nodes_ assoc id node)
+           (<v node))
+         (let [atm_ (atom x)
+               >flow (mi/eduction (comp (map (fn [x] [id x])) (dedupe)) (mi/watch atm_))
+               node (-node {:id id :kind :static :flow >flow :input atm_})]
+           (swap! nodes_ assoc id node)
+           (<v node)))
+       (when (mi/? <reactor) (emit! ::build-graph!)))
+      #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %))
+     <v))
 
   ([id deps f]
-   ((mi/sp
-     (swap! nodes_ assoc id (-node {:id id :kind :fn :f f :deps deps}))
-     (when (mi/? <reactor) (mi/? (emit! ::build-graph!))))
-    #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %))))
+   (let [<v (mi/dfv)]
+     ((mi/sp
+       (let [node (-node {:id id :kind :fn :f f :deps deps})]
+         (swap! nodes_ assoc id node)
+         (<v node)
+         (when (mi/? <reactor) (mi/? (emit! ::build-graph!)))))
+      #(timbre/debugf "node added successfuly %s" id %) #(timbre/error %))
+     <v)))
 
-(def add-watch!
+(deftask ::add-node!
+  [_ _ {:keys [id value deps f] :as node}]
+  (mi/sp
+   (cond
+     (and (keyword? id) (some? value)) (-add-node! id value)
+     (and (keyword? id) (vector? deps) (fn? f)) (-add-node! id deps f)
+     :else
+     (f/fail! "bad node format" {:node node}))))
+
+(def -add-watch!
   "create `event stream` watcher. argument should be an [[reify]] that
-  implements [[FlowEvent]] and [[ReactorContext]] protocols
+  implements [[FlowEvent]] and [[ReactorContext]] protocols.
+
 
   in fact adds the [[reify]] [[Event]] to the `event stream` as soon as the
-  `graph` is built"
+  `graph` is built, but cache ensures that each event is only added to the
+  stream once"
   (let [cache_ (volatile! #{})]
     (fn [e]
       (when-not (contains? @cache_ (event-id e))
@@ -648,38 +703,41 @@
             (emit! e)))
          (constantly nil) #(timbre/error %))))))
 
-(defmethod event ::listen!
-  [_ id f]
-  (reify ::listen!
-    ReactorContext
-    FlowEvent
-    (flow [_ dag _]
-      (mi/ap
-       (if-let [>flow (get dag id)]
-         (mi/?> (mi/eduction (comp (map (fn [[e v]] (f e v)))) >flow))
-         (f/fail (format "node %s dosen't exists!" id) {:id id :nodes @nodes_}))))))
+^::in-reactor-context
+(deftask ::add-watch!
+  [_ dag e]
+  (mi/sp (-add-watch! e)))
 
-(defn listen!
+(defn -listen!
   "[inpure] creates a `listener` for the [[Node]] of the `dag`, every time the
   value of a [[Node]] changes the function is called.
 
+
   function `f` should take two arguments, the first is the listener `id`, the
   second is the [[Node]] value. returns a function that allows to delete a
-  `listener`"
-  [id f]
-  (let [<v (emit! ::listen! id f)]
-    (fn []
-      ((mi/sp
-        (when-let [>f (mi/? <v)]
-          (when (or (fn? >f) (-publisher? >f))
-            (>f))))
-       #(timbre/debugf "successful unlisten %s" id %)
-       #(timbre/errorf "unsuccessful unlisten %s %s" id %)))))
+  `listener`
+
+
+  use as event
+  ```clojure
+  (emit ::listen! id f)
+  ```"
+  [id dag f]
+  (mi/ap
+   (if-let [>flow (get-in dag [id :flow])]
+     (mi/?> (mi/eduction (comp (map (fn [[e v]] (f e v)))) >flow))
+     (f/fail (format "node %s dosen't exists!" id) {:id id :nodes @nodes_}))))
+
+(defstream ::listen!
+  "see [[-listen!]]"
+  [_ dag _ id f]
+  (-listen! id dag f))
 
 #?(:cljs
    (defn subscribe
-     "creates `React/useEffect`, that creates a `listener` and calls the
+     "[inpure] creates `React/useEffect`, that creates a `listener` and calls the
 `set-state!` function on every change.
+
 
 returns [[reify]], which, when `deref`, returns `state`"
      ([id]
@@ -691,25 +749,29 @@ returns [[reify]], which, when `deref`, returns `state`"
         (react/useEffect
          (fn []
            (set! (.-current -m) m)
-           (listen! id (fn [_ v] (if-not (fn? v) (set-state! v) (set-state! (v m))))))
+           (let [<v (emit! ::listen! id (fn [_ v] (if-not (fn? v) (set-state! v) (set-state! (v m)))))]
+             (fn []
+               ((mi/sp (when-let [>f (mi/? <v)] (>f))) ; call publisher fn to cancel
+                #(timbre/debugf "successful unlisten %s" id %)
+                #(timbre/errorf "unsuccessful unlisten %s %s" id %)))))
          (js/Array. (str id) m'))
         (cljs.core/reify
           IDeref
           (-deref [_] state))))))
 
 (defn -event->deps-map
-  "[pure] based on the [[Event]] [[dependencies]], creates a `map` containing the current
-  state for the given `nodes`"
+  "[pure] based on the [[Event]] [[dependencies]], creates a `map` containing the
+  current state for the given `nodes`"
   [e dag]
   (mi/sp
-   (if (satisfies? Event e)
-     (let [deps (keep (fn [k] (get dag k)) (dependencies e))
-           >f (apply mi/latest (fn [& args] (into {} args)) deps)]
+   (if (event? e)
+     (let [deps (keep (fn [k] (get-in dag [k :flow])) (dependencies e))
+           >f (apply mi/latest (fn [& args] (into {} args)) (cond-> deps (keyword? deps) vector))]
        (mi/? (mi/reduce (comp reduced {}) nil >f)))
      {})))
 
 (defn -process-event
-  "processes the [[Event]] and maintains the specified order of protocol
+  "[pure] processes the [[Event]] and maintains the specified order of protocol
   function calls"
   [e m stream]
   (mi/ap
@@ -739,20 +801,19 @@ returns [[reify]], which, when `deref`, returns `state`"
    (constantly nil) #(timbre/error %)))
 
 (defn dispose!
-  "dispose reactor"
+  "[inpure] dispose reactor"
   []
   ((mi/sp
     (when-let [cb (mi/? <reactor)]
-      (timbre/info "dispose!")
       (cb)
       (reset! nodes_ nil)))
-   (constantly nil) #(timbre/error %)))
+   (fn [_] (timbre/info "reactor disposed!")) #(timbre/error %)))
 
 (defmethod event ::tap-node
   [id k]
   (reify id
     Event
-    (dependencies [_] [k])
+    (dependencies [_] k)
     TaskEvent
     (task [_ m]
       (mi/sp
@@ -764,7 +825,7 @@ returns [[reify]], which, when `deref`, returns `state`"
   [od k]
   (reify od
     Event
-    (dependencies [_] [k])
+    (dependencies [_] k)
     TaskEvent
     (task [_ m]
       (mi/sp
@@ -777,23 +838,6 @@ returns [[reify]], which, when `deref`, returns `state`"
 
 (comment
 
-  (def s1_ (atom nil))
-  (def s2_ (atom nil))
-  (def mbx (mi/mbx))
-  (def >f (mi/ap (loop [] (mi/amb> (mi/? mbx) (recur)))))
-  (def dispose
-    ((mi/reactor
-      (let [>f1 (mi/stream! (mi/ap (* 10 (mi/?> >f))))
-            >f2 (mi/stream! (mi/ap (println :f2 (* 10 (mi/?> >f1)))))
-            >f3 (mi/stream! (mi/ap (println :f3 (mi/?> >f))))]
-        (reset! s1_ >f1)
-        (reset! s2_ >f2)))
-     #(prn :success %) #(prn :error %)))
-  (@s1_)
-  (mbx 1)
-  ((mi/sp ((mi/? cancel))) prn prn)
-  (dispose)
-
   (defnode ::store {:a 2 :b 3 :c 1})
 
   (defnode ::a
@@ -804,22 +848,24 @@ returns [[reify]], which, when `deref`, returns `state`"
 
   (run!)
 
-  (emit! ::prn-node ::store)
-  (emit! ::prn-node ::a)
-
-  (listen! ::a (fn [e v] (prn :listen ::a e v)))
-
-  (deftask ::task1
-    [e {::keys [store]}]
-    (mi/sp e))
-
-  (mi/? (emit! ::task1))
+  (def unlisten (mi/? (emit! ::listen! ::a (fn [e v] (prn :listen ::a e v)))))
 
   (defupdate ::update-test
     [_ {::keys [store]}]
-    (mi/ap
+    (mi/sp
      (println :update-test store)
      {::store {:a (rand-int 10) :b (rand-int 10) :c (rand-int 10)}}))
+
+  (mi/? (emit! ::update-test))
+  (unlisten)
+
+  (emit! ::prn-node ::store)
+
+  (emit! ::prn-node ::a)
+
+  (deftask ::task1
+    [e {::keys [store]}]
+    (mi/sp (+ 1 1)))
 
   (emit-task ::proc1)
 
