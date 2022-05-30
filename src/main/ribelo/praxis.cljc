@@ -3,7 +3,7 @@
   #?(:cljs (:require-macros [ribelo.praxis :refer [defnode defeffect defstream emit]]))
   (:require
    [missionary.core :as mi]
-   #?(:clj  [clojure.core :as core]
+   #?(:clj [clojure.core :as core]
       :cljs [cljs.core :as core])
    #?(:cljs [goog.string :refer [format]])
    [ribelo.fatum :as f]
@@ -13,7 +13,7 @@
 (def -sentinel #?(:clj (Object.) :cljs (js/Object.)))
 
 (defn -now-udt []
-  #?(:clj  (System/currentTimeMillis)
+  #?(:clj (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
 
 (defn -kw-identical? [x y]
@@ -261,7 +261,7 @@
 (defn -watchable?
   "checks if `x` supports `add-watch`"
   [x]
-  #?(:clj  (instance? clojure.lang.IRef x)
+  #?(:clj (instance? clojure.lang.IRef x)
      :cljs (satisfies? cljs.core.IWatchable x)))
 
 (defn event?
@@ -290,8 +290,8 @@
   (cond
     (keyword? e)
     (f/when-ok [e' (assoc (event e) :args more)]
-               (mbx e')
-               (:result e'))
+      (mbx e')
+      (:result e'))
 
     (event? e)
     (let [e' (assoc e :args more)]
@@ -315,8 +315,8 @@
   [e & args]
   (mi/sp
    (f/if-ok [<v (mi/? (apply -emit e args))]
-            (mi/? <v)
-            (let [<r (mi/dfv)] (<r <v)))))
+     (mi/? <v)
+     (let [<r (mi/dfv)] (<r <v)))))
 
 (defn emit!
   "calls the [[emit]] and immediately execute the returned `task`. returns
@@ -589,14 +589,14 @@
   [_ _ >s k & args]
   (mi/ap
    (let [_ (mi/?> (mi/eduction (filter (partial event? k)) (take 1) >s))]
-     (mi/? (mi/sleep 0))                ; switch
+     (mi/? (mi/sleep 0)) ; switch
      (mi/? (mi/? (apply -emit args))))))
 
 (defstream ::after>
   [_ _ >s k & args]
   (mi/ap
    (let [_ (mi/?> (mi/eduction (filter (partial event? k)) (take 1) >s))]
-     (mi/? (mi/sleep 0))               ; swtich
+     (mi/? (mi/sleep 0)) ; swtich
      (mi/?> (mi/? (apply -emit args))))))
 
 ^::in-reactor-context
@@ -716,7 +716,7 @@
       (mi/stream!
        (mi/ap
         (let [[<v flow] (mi/?> <stream)
-              !         (mi/? <v)]
+              ! (mi/? <v)]
           (mi/? (mi/reduce (constantly nil) (mi/ap (! (mi/?> (mi/buffer 10 (mi/relieve {} flow))))))))))))
    #(prn :ok %) #(prn :err %))
 
