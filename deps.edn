@@ -1,10 +1,12 @@
 {:paths ["src/main"]
  :deps  {missionary/missionary {:mvn/version "b.26"}
-         com.taoensso/timbre   {:mvn/version "5.1.2"}
-         ribelo/fatum          {:local/root "../fatum"}}
+         com.taoensso/timbre {:mvn/version "5.1.2"}
+         com.github.ribelo/fatum {:mvn/version "0.0.31"}}
  :aliases
  {:dev
-  {:extra-deps {meander/epsilon {:mvn/version "0.0.650"}}
+  {:extra-deps {meander/epsilon {:mvn/version "0.0.650"}
+                nrepl/nrepl {:mvn/version "0.7.0"}
+                cider/cider-nrepl {:mvn/version "0.25.2"}}
    :extra-paths ["test"]}
 
   :build
