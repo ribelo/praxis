@@ -2,12 +2,12 @@
   (:refer-clojure :exclude [update run! reify resolve])
   #?(:cljs (:require-macros [ribelo.praxis :refer [defnode defeffect defstream emit]]))
   (:require
+   [missionary.core :as mi]
    #?(:clj  [clojure.core :as core]
       :cljs [cljs.core :as core])
-   [taoensso.timbre :as timbre]
-   [missionary.core :as mi]
+   #?(:cljs [goog.string :refer [format]])
    [ribelo.fatum :as f]
-   #?(:cljs [goog.string :refer [format]])))
+   [taoensso.timbre :as timbre]))
 
 ;; * utils
 (def -sentinel #?(:clj (Object.) :cljs (js/Object.)))
@@ -53,7 +53,6 @@
 
 ;; * macros
 
-#_{:clj-kondo/ignore [:unused-private-var]}
 (defn- -parse-input
   "parses the `map` `m` and extracts all namespaced and unnamespaced keys.
   supports both format, `{::keys [x y z]}` and `{v :k}` format"
@@ -152,11 +151,10 @@
            (mi/dfv)
            (fn
              (~(vec args) ~@body)))))))
-     
 
 #?(:clj
    (defmacro defeffect
-    "like [[defevent]] creates an [[event]] method."
+     "like [[defevent]] creates an [[event]] method."
      [id & args]
      (assert (keyword? id) "id should be keyword")
      (let [env (meta &form)
@@ -261,7 +259,7 @@
            (((.-f node) x) y))))))
 
 (defn -watchable?
-  "checks if `x` support `add-watch`"
+  "checks if `x` supports `add-watch`"
   [x]
   #?(:clj  (instance? clojure.lang.IRef x)
      :cljs (satisfies? cljs.core.IWatchable x)))
@@ -308,7 +306,7 @@
           (mi/reduce conj)))))
 
 (defn emit
-  "[pure] adds an [[event]] or a sequence of events to the `event stream`.
+  "[pure] add an [[event]] or a sequence of events to the `event stream`.
   the [[event]] can be either a [[Event]] record, or a
   `keyword` identifying an [[event]] `method`.
 
@@ -341,6 +339,7 @@
 (defmulti handle-error
   "allows automatic handling of errors arising as a result of [[Event]]
   function calls
+
 
   a more functional approach to error handling. "
   (fn [e _err] (when (event? e) (:id e))))
