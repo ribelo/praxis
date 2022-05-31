@@ -1,0 +1,2 @@
+{:hooks {:macroexpand {ribelo.praxis/defeffect ribelo.praxis/defeffect
+                       ribelo.praxis/defevent ribelo.praxis/defevent}}}

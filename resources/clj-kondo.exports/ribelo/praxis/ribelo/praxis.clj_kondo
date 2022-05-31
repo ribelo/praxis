@@ -1,0 +1,9 @@
+(ns ribelo.praxis)
+
+(defmacro defevent [id & args]
+  `(defmethod ~'ribelo.praxis/event ~id ~['id]
+     (fn ~(vec (first args))
+       ~'id ~@args)))
+
+(defmacro defeffect [kw & body]
+  `(ribelo.praxis/defevent ~kw ~@body))
