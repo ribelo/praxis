@@ -180,8 +180,10 @@
 (def ^:private mbx (mi/mbx))
 (def ^:private <reactor (mi/dfv))
 
+(deftype Listener [publisher f])
+
 #?(:clj
-   (defrecord Node [id kind f input deps flow]
+   (defrecord Node [id kind f input deps flow listeners]
      clojure.lang.IFn
      (invoke [_ m]
        (f id m))
@@ -195,7 +197,7 @@
          (f/fail! "can't reset node" {:id id}))))
 
    :cljs
-   (defrecord Node [id kind f input deps flow]
+   (defrecord Node [id kind f input deps flow listeners]
      IFn
      (-invoke [_ m]
        (f id m))
@@ -205,12 +207,12 @@
      (-reset! [_ newval]
        (if (instance? Atom input)
          (reset! input newval)
-         (f/fail! "can't reset node" {:id id})))))
+         (f/fail! "can't reset node" {:id id :type (type input)})))))
 
 (defn- -node
   "creates [[Node]]"
   [{:keys [id kind f input deps flow]}]
-  (->Node id kind f input deps flow))
+  (->Node id kind f input deps flow (atom [])))
 
 #?(:clj
    (def dag
@@ -363,6 +365,24 @@
     (transient {})
     m)))
 
+(defn -listen
+  "[pure] creates a `listener` for the [[Node]] of the `dag`, every time the
+  value of a [[Node]] changes the function is called.
+
+
+  function `f` should take two arguments, the first is the listener `id`, the
+  second is the [[Node]] value. returns a function that allows to delete a
+  `listener`
+
+
+  use as event
+  ```clojure
+  (emit ::listen! id f)
+  ```"
+  [>flow f]
+  (mi/ap
+   (mi/?> (mi/eduction (comp (map (fn [[e v]] (f e v)))) >flow))))
+
 (defn- -link!
   "creates an edge between the nodes of the graph"
   [id >fs]
@@ -373,8 +393,10 @@
 (defn- -build-graph!
   "creates a graph based on the declared nodes and their relationships"
   []
+  (println :-build-graph!)
   (mi/sp
    (loop [[[id ^Node node] & more] @nodes_ acc []]
+     (println :-build-graph id)
      (if id
        (if (or (-kw-identical? :watchable (.-kind node)) (-kw-identical? :static (.-kind node)))
          (recur more (conj acc (mi/signal! (.-flow node))))
@@ -384,9 +406,20 @@
                             (.-flow ^Node x)
                             (f/fail! (format "node %s dosen't exists!" k) {::id k}))) ks)]
            (if (every? some? in)
-             (let [>f (-link! id in)]
-               (swap! nodes_ assoc-in [id :flow] (mi/signal! >f))
-               (recur more (conj acc >f)))
+             (let [>flow (-link! id in)
+                   listeners_ (.-listeners node)]
+               (swap! nodes_ assoc-in [id :flow] (mi/signal! >flow))
+               (loop [[^Listener lstn & more] @listeners_ acc (transient [])]
+                 (println :loop lstn)
+                 (if lstn
+                   (let [pub (.-publisher lstn)
+                         f (.-f lstn)]
+                     ;; unlisten
+                     (when pub (pub))
+                     (recur more (conj! (Listener. (mi/stream! (-listen >flow f)) f))))
+                   (reset! listeners_ (persistent! acc))))
+
+               (recur more (conj acc >flow)))
              (recur (conj (into [] more) [id node]) acc))))
        acc))))
 
@@ -409,9 +442,7 @@
   (mi/ap
    (let [e (mi/?> (mi/stream! (-debounce (mi/eduction (filter (partial event? ::build-graph!)) >s))))
          <v (:result e)]
-     (try (<v ((:f e) e nil))
-          (catch :default e
-            (tap> [:e e]))))))
+     (<v ((:f e) e nil)))))
 
 (defn -add-node!
   "[pure] adds a node to the graph, prefer using [[defnode]]
@@ -456,7 +487,7 @@
      (f/fail! "bad node format" {::node node}))))
 
 (def -add-watch!
-  "create `event stream` watcher. argument should be an [[Event]] record. 
+  "create `event stream` watcher. argument should be an [[Event]] record.
 
 
   in fact adds the [[Event]] to the `event stream` as soon as the
@@ -474,30 +505,23 @@
   [_ dag e & args]
   (mi/sp (mi/? (apply -add-watch! e args))))
 
-(defn -listen!
-  "[inpure] creates a `listener` for the [[Node]] of the `dag`, every time the
-  value of a [[Node]] changes the function is called.
-
-
-  function `f` should take two arguments, the first is the listener `id`, the
-  second is the [[Node]] value. returns a function that allows to delete a
-  `listener`
-
-
-  use as event
-  ```clojure
-  (emit ::listen! id f)
-  ```"
-  [id dag f]
-  (mi/ap
-   (if-let [>flow (get-in dag [id :flow])]
-     (mi/?> (mi/eduction (comp (map (fn [[e v]] (f e v)))) >flow))
-     (f/fail (format "node %s dosen't exists!" id) {::id id ::nodes @nodes_}))))
-
-(defstream ::listen!
+^::in-reactor-context
+(defeffect ::listen!
   "see [[-listen!]]"
-  [_ dag _ id f]
-  (-listen! id dag f))
+  [_ dag id f]
+  (mi/sp
+   (if-let [node (get dag id)]
+     (let [>flow (:flow node)
+           listeners_ (.-listeners node)]
+       (if >flow
+         (let [lstn (Listener. (mi/stream! (-listen >flow f)) f)]
+           (swap! listeners_ conj lstn))
+         (let [lstn (Listener. nil f)]
+           (println ::listen! lstn)
+           (swap! listeners_ conj lstn)
+           ;; (mi/? (emit ::build-graph!))
+           )
+         )))))
 
 (defn- -resolve-deps
   "[pure] based on the [[Event]] [[deps]], creates a `map` containing the
@@ -520,6 +544,7 @@
                  (mi/stream!
                   (mi/ap
                    (let [e (mi/?= >e)]
+                     (println :run :e e)
                      (when (and (event? e) (not (:custom? e)))
                        (let [f (:f e)
                              args (:args e)
@@ -532,6 +557,7 @@
                                       (f/attempt (apply f e dag args))
                                       :else
                                       (f/attempt (apply f e (mi/? (-resolve-deps dag (:deps e))) args)))]
+                         (println :run :effect effect)
                          (if (f/ok? effect)
                            (cond
                              (:reactor-context? e)
@@ -635,7 +661,10 @@
     (println :eval-node :id id :val (:a store))
     (:a store))
 
-  (run!)
+  (do (run!)
+      (mi/? (mi/sleep 10))
+      (emit! ::listen! ::a (fn [e v] (prn :listen ::a e v))))
+  (mi/? (emit ::prn-node ::a))
 
   (defeffect ::a
     [e dag]
@@ -645,11 +674,10 @@
      (prn :after ::a)
      ::a))
 
-  (emit! ::reset! {::store {:a 1 :b 1 :c 1}})
-  ((emit! ::prn-node ::store) prn prn)
+  (emit! ::reset! {::store {:a (rand-int 10) :b (rand-int 10) :c (rand-int 10)}})
 
-  ((emit! ::a) tap> tap>)
-
+  (println @nodes_)
+  (event ::listen!)
   (def unlisten (mi/? (emit! ::listen! ::a (fn [e v] (prn :listen ::a e v)))))
 
   (defupdate ::update-test
