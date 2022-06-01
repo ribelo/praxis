@@ -515,8 +515,7 @@
            (swap! listeners_ conj lstn))
          (let [lstn (Listener. nil f)]
            (swap! listeners_ conj lstn)
-           (mi/? (emit ::build-graph!))
-           ))))))
+           (mi/? (emit ::build-graph!))))))))
 (defn- -resolve-deps
   "[pure] based on the [[Event]] [[deps]], creates a `map` containing the
   current state for the given `nodes`"
