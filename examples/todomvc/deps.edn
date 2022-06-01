@@ -1,0 +1,28 @@
+{:paths ["src" "resources"]
+ :deps {missionary/missionary {:mvn/version "b.26"}
+        funcool/rumext {:mvn/version "2022.04.10-141"}
+        ribelo/extropy {:git/url "https://github.com/ribelo/extropy"
+                        :sha "0e596744f097858027db8f7bc80547b238a3fb8a"}
+        ribelo/praxis {:local/root "/home/ribelo/code/ribelo/praxis"}
+        ;; com.github.ribelo/praxis {:git/url "https://github.com/ribelo/praxis"
+        ;;                           :sha "afabb7252b4b9b7e681370f8e6a36738ac501b1d"}
+        com.github.ribelo/praxis-react {:git/url "https://github.com/ribelo/praxis-react"
+                                        :sha "8fb873aa033bc4ba1fcd067724ff733ec097b5f3"}}
+ :aliases
+ {:dev
+  {:extra-deps {nrepl/nrepl {:mvn/version "0.7.0"}
+                cider/cider-nrepl {:mvn/version "0.25.2"}}
+   :extra-paths ["test"]}
+
+  :build
+  {:extra-paths ["build"]
+   :extra-deps {io.github.clojure/tools.build {:git/tag "v0.1.9" :git/sha "6736c83"}
+                slipset/deps-deploy {:mvn/version "RELEASE"}}
+   :exec-fn build/jar}
+  :deploy
+  {:extra-paths ["build"]
+   :extra-deps {io.github.clojure/tools.build {:git/tag "v0.1.9" :git/sha "6736c83"}
+                slipset/deps-deploy {:mvn/version "RELEASE"}}
+   :exec-fn build/clojars}
+  :cljs {:extra-deps {thheller/shadow-cljs {:mvn/version "2.19.1"}}}}}
+
