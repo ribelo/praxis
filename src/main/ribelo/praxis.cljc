@@ -393,10 +393,8 @@
 (defn- -build-graph!
   "creates a graph based on the declared nodes and their relationships"
   []
-  (println :-build-graph!)
   (mi/sp
    (loop [[[id ^Node node] & more] @nodes_ acc []]
-     (println :-build-graph id)
      (if id
        (if (or (-kw-identical? :watchable (.-kind node)) (-kw-identical? :static (.-kind node)))
          (recur more (conj acc (mi/signal! (.-flow node))))
@@ -410,13 +408,12 @@
                    listeners_ (.-listeners node)]
                (swap! nodes_ assoc-in [id :flow] (mi/signal! >flow))
                (loop [[^Listener lstn & more] @listeners_ acc (transient [])]
-                 (println :loop lstn)
                  (if lstn
                    (let [pub (.-publisher lstn)
                          f (.-f lstn)]
                      ;; unlisten
                      (when pub (pub))
-                     (recur more (conj! (Listener. (mi/stream! (-listen >flow f)) f))))
+                     (recur more (conj! acc (Listener. (mi/stream! (-listen >flow f)) f))))
                    (reset! listeners_ (persistent! acc))))
 
                (recur more (conj acc >flow)))
@@ -517,12 +514,9 @@
          (let [lstn (Listener. (mi/stream! (-listen >flow f)) f)]
            (swap! listeners_ conj lstn))
          (let [lstn (Listener. nil f)]
-           (println ::listen! lstn)
            (swap! listeners_ conj lstn)
-           ;; (mi/? (emit ::build-graph!))
-           )
-         )))))
-
+           (mi/? (emit ::build-graph!))
+           ))))))
 (defn- -resolve-deps
   "[pure] based on the [[Event]] [[deps]], creates a `map` containing the
   current state for the given `nodes`"
@@ -544,7 +538,6 @@
                  (mi/stream!
                   (mi/ap
                    (let [e (mi/?= >e)]
-                     (println :run :e e)
                      (when (and (event? e) (not (:custom? e)))
                        (let [f (:f e)
                              args (:args e)
@@ -557,7 +550,6 @@
                                       (f/attempt (apply f e dag args))
                                       :else
                                       (f/attempt (apply f e (mi/? (-resolve-deps dag (:deps e))) args)))]
-                         (println :run :effect effect)
                          (if (f/ok? effect)
                            (cond
                              (:reactor-context? e)
