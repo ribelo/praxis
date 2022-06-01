@@ -133,8 +133,7 @@
   the macro underneath creates an [[event]] method for the `id` returning a
   [[Event]] record.
 
-  supports `::silent` and `::in-reactor-context` metadata, see [[SilentEvent]]
-  and [[ReactorContext]].
+  supports `::silent` and `::in-reactor-context` metadata.
   "
      [id & args]
      (assert (keyword? id) "id should be keyword")
@@ -216,7 +215,7 @@
 
 #?(:clj
    (def dag
-     "the whole body of the `graph`. it is a proxy for the private [[nodes_]] atom to
+     "the whole body of the `graph`. it is a proxy for the private nodes_ atom to
   make sure we don't hurt ourselves by directly manipulating it"
      (core/reify
        clojure.lang.ILookup
@@ -271,7 +270,7 @@
   checks furthermore if the [[event-id]] is identical to the `id`.
 
 
-  can be used to filter [[SilentEvent]] from the `event stream`"
+  can be used to filter SilentEvent from the `event stream`"
   ([e]
    (instance? Event e))
   ([id e]
@@ -308,12 +307,11 @@
           (mi/reduce conj)))))
 
 (defn emit
-  "[pure] add an [[event]] or a sequence of events to the `event stream`.
-  the [[event]] can be either a [[Event]] record, or a
-  `keyword` identifying an [[event]] `method`.
+  "[pure] add an [[event]] or a sequence of events to the `event stream`. the
+  [[event]] can be either a [[Event]] record, or a `keyword` identifying an
+  [[event]] `method`.
 
-  returns the value returned by the event, or `stream` if the event
-  implements [[ReactorContext]]."
+  returns the value returned by the event or `stream`"
   [e & args]
   (mi/sp
    (f/if-ok [<v (mi/? (apply -emit e args))]
@@ -321,8 +319,9 @@
      (let [<r (mi/dfv)] (<r <v)))))
 
 (defn emit!
-  "calls the [[emit]] and immediately execute the returned `task`. returns
-  `dataflow` containing the result of the reduction."
+  "calls the [[emit]] and immediately execute the returned `task`. 
+  
+  returns `dataflow` containing the result of the reduction."
   [e & args]
   (let [<r (mi/dfv)
         <v (apply emit e args)]
@@ -331,6 +330,7 @@
 
 (defn emit>
   "calls the [[emit]] and immediately `reduce` the returned `flow`.
+
   returns `dataflow` containing the result of the reduction."
   [e & args]
   (let [<r (mi/dfv)
