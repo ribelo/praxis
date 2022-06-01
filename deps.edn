@@ -4,8 +4,7 @@
          com.github.ribelo/fatum {:mvn/version "0.0.31"}}
  :aliases
  {:dev
-  {:extra-deps {meander/epsilon {:mvn/version "0.0.650"}
-                nrepl/nrepl {:mvn/version "0.7.0"}
+  {:extra-deps {nrepl/nrepl {:mvn/version "0.7.0"}
                 cider/cider-nrepl {:mvn/version "0.25.2"}}
    :extra-paths ["test"]}
 
