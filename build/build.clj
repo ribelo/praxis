@@ -1,0 +1,82 @@
+(ns build
+  (:require
+   [clojure.tools.build.api :as b]
+   [clojure.java.shell :as shell]
+   [clojure.string :as str]
+   [meander.epsilon :as m]
+   [deps-deploy.deps-deploy :as d]))
+
+(def scm-url "git@github.com:ribelo/praxis.git")
+
+(defn sha
+  [{:keys [dir path] :or {dir "."}}]
+  (-> {:command-args (cond-> ["git" "rev-parse" "HEAD"]
+                       path (conj "--" path))
+       :dir (.getPath (b/resolve-path dir))
+       :out :capture}
+      b/process
+      :out
+      str/trim))
+
+(defn git-branch-name
+  "Attempts to get the current branch name via the shell."
+  []
+  (m/match (shell/sh "git" "rev-parse" "--abbrev-ref" "HEAD")
+    {:exit 0, :out ?out}
+    (str/trim ?out)
+
+    ?result
+    (throw (ex-info "Unable to compute branch name" ?result))))
+
+(def git-commit-count-start
+  "Starting SHA to count commits from."
+  "bfa1e08b6f943afe66dd6b638414d445ae786c35")
+
+(defn git-branch-commit-count
+  "Attempts to get the current number of commits on the current branch
+  via the shell."
+  []
+  (m/match (shell/sh "git" "rev-list" (str git-commit-count-start "...") "--count")
+    {:exit 0, :out ?out}
+    (str/trim ?out)
+
+    ?result
+    (throw (ex-info "Unable to compute commit count" ?result))))
+
+(def lib (symbol "com.github.ribelo" "praxis"))
+(def basis (b/create-basis {:project "deps.edn"}))
+(def version (format "0.1.%s" (git-branch-commit-count)))
+(def class-dir "target/classes")
+(def jar-file (format "target/%s-%s.jar" (git-branch-name) version))
+
+(defn jar [_]
+  (b/delete {:path "target"})
+  (b/write-pom {:class-dir class-dir
+                :lib lib
+                :version version
+                :basis basis
+                :src-dirs ["src/main"]
+                :scm {:tag (sha nil)
+                      :connection (str "scm:git:" scm-url)
+                      :developerConnection (str "scm:git:" scm-url)
+                      :url scm-url}})
+  (b/copy-dir {:src-dirs   ["src/main"]
+               :target-dir class-dir})
+  (b/jar {:class-dir class-dir
+          :jar-file  jar-file}))
+
+(defn deploy [args]
+  (-> args
+      (assoc  :artifact jar-file
+              :pom-file (str class-dir "/META-INF/maven/" (namespace lib) "/" (name lib) "/pom.xml"))
+      (d/deploy)))
+
+(defn clojars [args]
+  (-> {:installer :remote :sign-releases? true}
+      (merge args)
+      (deploy)))
+
+(defn install [args]
+  (-> {:installer :local}
+      (merge args)
+      (deploy)))
